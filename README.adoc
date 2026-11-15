@@ -1,4 +1,6 @@
 = astro-scripts
+:toc:
+:toclevels: 2
 
 Command-line helpers for processing astrophotography data with https://siril.org[Siril] and
 https://github.com/Rolf-Hempel/PlanetarySystemStacker[PlanetarySystemStacker] (PSS).
