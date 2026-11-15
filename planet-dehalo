@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+planet-dehalo: subtract the glow around an overexposed planet from a linear image.
+
+  planet-dehalo [options] FILE
+
+For moon shots where the planet is deliberately overexposed. The glow around the planet
+is real scattered light, so stretching makes it grow along with the moons. This measures
+the glow's brightness outward from the planet's centre, separately in angular sectors
+(the glow is stronger along Saturn's rings than across them), using the median of each
+ring segment so the small moons are ignored. It builds a smooth model from that and
+subtracts it from the linear image. The moons, including the inner ones sitting in the
+glow, keep their brightness. FILE is a linear FITS image (mono or RGB); run it before
+any stretch.
+
+The overexposed pixels themselves (planet and ring tips) are left as they are, so the
+planet's position stays visible for lining up the properly exposed planet layer.
+
+Output: <input>_dehalo.fit next to the input (or -o FILE), and with --model the
+subtracted glow as <input>_halo.fit.
+
+Options:
+  -o, --output FILE   output file (default <input>_dehalo.fit)
+      --model         also save the subtracted glow as <input>_halo.fit
+      --sectors N     angular sectors for the glow profile (default 24; 1 = circular)
+      --sat F         fraction of the maximum that counts as overexposed (default 0.9)
+      --ring-width N  width of each ring segment in px (default 2)
+  -h, --help          show this help
+
+Examples:
+  planet-dehalo Saturn-moons_2026-11-09-0_5s_linear.fit
+  planet-dehalo --model --sectors 1 image.fit       # one sector = circular rings
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+from astropy.io import fits
+
+
+def planet_centre(lum: np.ndarray, sat_frac: float):
+    """Centre of the overexposed planet: the bright pixels around the brightest point
+    of a binned copy (binning dilutes moons and stars). Returns (cy, cx, radius, n)."""
+    h, w = lum.shape
+    b = 8
+    binned = lum[: h // b * b, : w // b * b].reshape(h // b, b, w // b, b).mean((1, 3))
+    py, px = np.unravel_index(int(np.argmax(binned)), binned.shape)
+    cy, cx = (py + 0.5) * b, (px + 0.5) * b
+    r = 250
+    y0, y1, x0, x1 = max(0, int(cy - r)), min(h, int(cy + r)), max(0, int(cx - r)), min(w, int(cx + r))
+    win = lum[y0:y1, x0:x1]
+    ys, xs = np.nonzero(win >= sat_frac * win.max())
+    if len(xs) == 0:
+        return cy, cx, 0.0, 0
+    cy, cx = ys.mean() + y0, xs.mean() + x0
+    radius = float(np.hypot(ys + y0 - cy, xs + x0 - cx).max())   # reach of the overexposed blob
+    return cy, cx, radius, len(xs)
+
+
+def dilate(mask: np.ndarray, n: int) -> np.ndarray:
+    out = mask.copy()
+    for _ in range(n):
+        m = out.copy()
+        m[1:, :] |= out[:-1, :]
+        m[:-1, :] |= out[1:, :]
+        m[:, 1:] |= out[:, :-1]
+        m[:, :-1] |= out[:, 1:]
+        out = m
+    return out
+
+
+def binned_median(vals: np.ndarray, idx: np.ndarray, nbins: int):
+    """Median of vals in each integer bin of idx; NaN where a bin is empty."""
+    order = np.lexsort((vals, idx))
+    idx, vals = idx[order], vals[order]
+    counts = np.bincount(idx, minlength=nbins)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    med = np.full(nbins, np.nan)
+    nz = counts > 0
+    med[nz] = vals[starts[nz] + (counts[nz] - 1) // 2]
+    return med, counts
+
+
+def smooth_1d(a: np.ndarray, width: int, circular: bool = False) -> np.ndarray:
+    """NaN-aware running median followed by a running mean."""
+    if width <= 1:
+        return a
+    n, half = len(a), width // 2
+    ext = np.concatenate([a[-half:], a, a[:half]]) if circular else np.pad(a, half, mode="edge")
+    med = np.array([np.nanmedian(ext[i:i + width]) if np.any(~np.isnan(ext[i:i + width])) else np.nan
+                    for i in range(n)])
+    ext = np.concatenate([med[-half:], med, med[:half]]) if circular else np.pad(med, half, mode="edge")
+    k = np.ones(width) / width
+    # mean that ignores NaN
+    num = np.convolve(np.nan_to_num(ext), k, mode="valid")
+    den = np.convolve((~np.isnan(ext)).astype(float), k, mode="valid")
+    with np.errstate(invalid="ignore"):
+        return np.where(den > 0, num / np.maximum(den, 1e-12), np.nan)
+
+
+def fill_nan(a: np.ndarray) -> np.ndarray:
+    """Fill NaNs along a 1-D profile with the nearest valid value."""
+    ok = ~np.isnan(a)
+    if not ok.any():
+        return np.zeros_like(a)
+    i = np.arange(len(a))
+    return np.interp(i, i[ok], a[ok])
+
+
+def main():
+    ap = argparse.ArgumentParser(usage="%(prog)s [options] FILE")
+    ap.format_help = lambda: __doc__  # --help prints the docstring
+    ap.add_argument("input", type=Path, metavar="FILE")
+    ap.add_argument("-o", "--output", type=Path)
+    ap.add_argument("--model", action="store_true")
+    ap.add_argument("--sectors", type=int, default=24)
+    ap.add_argument("--sat", type=float, default=0.9)
+    ap.add_argument("--ring-width", type=int, default=2)
+    args = ap.parse_args()
+
+    with fits.open(args.input) as hdul:
+        hdr = hdul[0].header.copy()
+        data = hdul[0].data.astype(np.float32)
+    if data.ndim not in (2, 3):
+        sys.exit("expected a 2-D (mono) or 3-D (RGB) image")
+    planes = data if data.ndim == 3 else data[None]
+    lum = planes.mean(axis=0)
+    h, w = lum.shape
+
+    cy, cx, prad, npix = planet_centre(lum, args.sat)
+    if npix < 20:
+        sys.exit("no overexposed planet found (try a lower --sat)")
+    print(f"planet at x {cx:.0f}, y {cy:.0f}; overexposed blob {npix} px reaching {prad:.0f} px from centre")
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    dx, dy = (xx - cx).astype(np.float32), (yy - cy).astype(np.float32)
+    r = np.hypot(dx, dy)
+    theta = np.mod(np.arctan2(dy, dx), 2 * np.pi)
+
+    # overexposed pixels (any channel) near the planet, plus a 3 px margin: left untouched
+    sat_any = (planes >= args.sat * planes.max()).any(axis=0) & (r <= prad * 1.5 + 5)
+    keep = dilate(sat_any, 3)
+    valid = ~keep
+
+    rw = max(1, args.ring_width)
+    rbin = (r / rw).astype(np.int32)
+    nr = int(rbin.max()) + 1
+    ns = max(1, args.sectors)
+    spos = theta / (2 * np.pi) * ns                     # fractional sector position
+    sbin = np.minimum(spos.astype(np.int32), ns - 1)
+
+    # beyond this radius the glow is treated as circular (sectors get sparse at the edges)
+    r_sect = min(12 * prad + 100, 0.5 * min(h, w))
+    min_count = 8
+
+    out = np.empty_like(planes)
+    halo = np.zeros_like(planes)
+    for c, plane in enumerate(planes):
+        v = plane[valid]
+        # circular profile
+        circ, _ = binned_median(v, rbin[valid], nr)
+        circ = fill_nan(smooth_1d(circ, 5))
+        sky = float(np.median(circ[int(0.8 * nr):]))     # far out: sky level, left in place
+        circ = np.clip(circ - sky, 0, None)
+        model = circ[rbin]
+        if ns > 1:
+            idx = rbin[valid] * ns + sbin[valid]
+            med, cnt = binned_median(v, idx, nr * ns)
+            prof = med.reshape(nr, ns)
+            prof[cnt.reshape(nr, ns) < min_count] = np.nan
+            for s in range(ns):                           # smooth along radius
+                prof[:, s] = smooth_1d(prof[:, s], 5)
+            for k in range(nr):                           # smooth across sectors
+                prof[k, :] = smooth_1d(prof[k, :], 3, circular=True)
+            prof = prof - sky
+            prof = np.where(np.isnan(prof), circ[:, None], np.clip(prof, 0, None))
+            # interpolate between neighbouring sector centres to avoid seams
+            f = spos - 0.5
+            s0 = np.floor(f).astype(np.int32) % ns
+            s1 = (s0 + 1) % ns
+            t = (f - np.floor(f)).astype(np.float32)
+            sect = (1 - t) * prof[rbin, s0] + t * prof[rbin, s1]
+            # blend to the circular profile towards r_sect
+            b = np.clip((r - 0.7 * r_sect) / (0.3 * r_sect), 0, 1)
+            model = (1 - b) * sect + b * model
+        model = model.astype(np.float32)
+        model[keep] = 0
+        halo[c] = model
+        out[c] = np.where(keep, plane, plane - model)
+
+    out_data = out if data.ndim == 3 else out[0]
+    hdr.add_history(f"planet-dehalo: glow subtracted around x={cx:.1f} y={cy:.1f} ({ns} sectors)")
+    for k in ("BZERO", "BSCALE"):
+        hdr.remove(k, ignore_missing=True)
+    outfile = args.output or args.input.with_name(args.input.stem + "_dehalo.fit")
+    fits.PrimaryHDU(out_data.astype(np.float32), hdr).writeto(outfile, overwrite=True)
+    print(f"wrote {outfile}")
+    if args.model:
+        mfile = args.input.with_name(args.input.stem + "_halo.fit")
+        fits.PrimaryHDU((halo if data.ndim == 3 else halo[0]).astype(np.float32), hdr).writeto(mfile, overwrite=True)
+        print(f"wrote {mfile}")
+
+
+if __name__ == "__main__":
+    main()

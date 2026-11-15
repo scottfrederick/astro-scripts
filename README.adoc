@@ -1,0 +1,583 @@
+= astro-scripts
+
+Command-line helpers for processing astrophotography data with https://siril.org[Siril] and
+https://github.com/Rolf-Hempel/PlanetarySystemStacker[PlanetarySystemStacker] (PSS).
+
+  * deep-sky preprocessing and linear processing
+  * planetary stacking, alignment, cropping, de-haloing, sharpening
+  * JPEG export
+
+The scripts assume inputs use the same conventions as https://www.zwoastro.com/product-category/asiair/[ASIAIR]. 
+
+== Scripts
+
+[cols="2,1,6",options="header"]
+|===
+|Script |Language |What it does
+
+|`+planet-stack+` |python |Stack selected ASIAIR planetary clips with PSS, then RGB-align them
+|`+planet-sharpen+` |python |Crop planetary stacks and apply Siril's Richardson-Lucy deconvolution
+|`+planet-align+` |python |Register frames on the planet's centroid
+|`+planet-crop+` |python |Crop planetary FITS images to a fixed size around the planet
+|`+planet-dehalo+` |python |Subtract the glow around an overexposed planet
+|`+astro-preprocess+` |bash |Calibrate, register and stack ASIAIR sessions with Siril
+|`+astro-linear+` |bash |Headless linear processing of a stack with Siril
+|`+astro-export+` |bash |Save finished images as JPEG with Siril, optionally enlarged
+|===
+
+Run any script with `+--help+` for its options, or see the <<_command_reference,command reference>>.
+
+== Requirements
+
+* Linux with bash and the GNU coreutils
+* Python 3.10 or newer with `+numpy+` and `+astropy+`
+* Siril 1.2.4 or newer
+** `+siril-cli+` on `+PATH+`, or the `+org.siril.Siril+` flatpak
+** set `+SIRIL_CLI+` to override, e.g. `+SIRIL_CLI="siril-cli"+`
+* https://starnetastro.com[StarNet] for star removal in `+astro-linear+`
+** installed and set in Siril's preferences
+* PlanetarySystemStacker for `+planet-stack+` 
+** importable from Python and with its `+PlanetarySystemStacker+` command on `+PATH+`
+
+== Setup
+
+=== Nix / NixOS
+
+[source,sh]
+----
+cd astro-scripts
+nix develop
+----
+
+This opens a shell with Python (numpy, astropy and PSS), the `+PlanetarySystemStacker+` command,
+and the scripts on `+PATH+`. PSS isn't in nixpkgs, so it's built from `+nix/planetary-system-stacker.nix+`;
+`+nix build+` builds just PSS.
+
+=== Other distributions
+
+[source,sh]
+----
+cd astro-scripts
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-pss.txt   # only for planet-stack
+source .venv/bin/activate
+export PATH="$PWD:$PATH"
+----
+
+Or install `+python3-numpy+` and `+python3-astropy+` from your distribution's packages.
+
+== Workflows
+
+The scripts cover three kinds of session. Each workflow below lists the steps in the order
+they're run; steps marked _by hand_ are done in Siril's GUI or an image editor. The paths are
+examples: raw data in `+~/Astro/<target>+`, results in `+~/Astro/<target>-processed+`.
+
+=== Planetary
+
+Lucky imaging of a planet: many short video clips (AVI) captured with the ASIAIR, each with an
+`+.avi.txt+` sidecar recording its exposure and gain. Each clip is stacked into one image with
+PSS, sharpened by deconvolution, finished by hand, and exported as an enlarged JPEG.
+
+==== 1. Stack the clips
+
+[source,sh]
+----
+planet-stack -n --date 2026-11-09    # check the selection first
+planet-stack --date 2026-11-09 -o ~/Astro/Saturn-processed/2026-11-09
+----
+
+Selects clips by exposure and gain, stacks each with PSS and aligns its color channels.
+
+Outputs as `+<clip>_pss_rgb.fits+`.
+
+==== 2. Sharpen
+
+[source,sh]
+----
+planet-sharpen ~/Astro/Saturn-processed/2026-11-09
+----
+
+Crops each stack around the planet and applies Richardson-Lucy deconvolution in one Siril run.
+
+Outputs as  `+<clip>_pss_rgb_sharpened.fits+`.
+
+To stack several stacks together in Siril instead, first bring them to the same size with
+`+planet-crop DIR/*_pss_rgb.fits -o DIR/crop+`.
+
+==== 3. Finish (by hand)
+
+In Siril, perform stretch, color and any final touches then save as `+<name>_finished.fits+`.
+
+==== 4. Export
+
+[source,sh]
+----
+astro-export -s 2 ~/Astro/Saturn-processed/2026-11-09/*_finished.fits
+----
+
+Writes an enlarged JPEG named after the capture, e.g. `+2026-11-09-211008-Saturn.jpg+`.
+
+=== Planet with moons (background for compositing)
+
+A planet's moons are far fainter than the planet, so they need long exposures (around 0.5 s to
+1 s, captured as FITS frames, e.g. with an ASIAIR Autorun) that leave the planet overexposed.
+The stacked moon image becomes a background layer, and the properly exposed planet from the
+planetary workflow is composited on top of it. There are too few stars to align on, so frames
+are aligned on the planet instead, and no calibration frames are needed.
+
+Raw layout: one folder per exposure set, each with a `+Light+` folder, e.g.
+`+~/Astro/Saturn-moons/2026-11-09-1.0s/Light/*.fit+`.
+
+==== 1. Stack
+
+[source,sh]
+----
+astro-preprocess --lights-only --planet ~/Astro/Saturn-moons
+----
+
+Removes hot pixels with cosmetic correction, debayers, aligns every frame on the planet
+(`+planet-align+`) and stacks each exposure set separately.
+
+Outputs `+~/Astro/Saturn-moons-processed/result_<set>_<seconds>s.fit+`.
+
+==== 2. Remove the glow
+
+[source,sh]
+----
+astro-linear -c 0 --no-color --no-starnet --dehalo \
+    ~/Astro/Saturn-moons-processed/result_2026-11-09-1.0s_120s.fit
+----
+
+Subtracts the scattered light around the overexposed planet (`+planet-dehalo+`) so the moons
+stay clean when stretched.
+
+Outputs `+<name>_dehalo.fit+` and a JPEG preview.
+
+==== 3. Stretch and composite (by hand)
+
+Stretch `+<name>_dehalo.fit+` in Siril, then layer the finished planet image over it in an
+image editor, lined up on the overexposed planet.
+
+==== 4. Export
+
+[source,sh]
+----
+astro-export ~/Astro/Saturn-moons-processed/Saturn-moons_composite.fits
+----
+
+Exports the composite as a JPEG, if it was saved as FITS; otherwise export it from the image
+editor.
+
+=== Deep-sky
+
+Several nights on a galaxy or nebula with a cooled one-shot-color camera. Each night is
+calibrated with its own flats and with darks and biases from a calibration library, then all
+nights are stacked together. The linear processing is scripted, stretching and star
+recombination are done by hand.
+
+Raw layout (ASIAIR): 
+
+* one folder per night with `+Light+` and `+Flat+`, e.g.
+`+~/Astro/M33/2026-11-07/Light/*.fit+`
+* darks and biases in `+~/Astro/Calibration+`, matched on
+exposure, gain, offset, binning and sensor temperature from the FITS headers
+
+==== 1. Stack
+
+[source,sh]
+----
+astro-preprocess -n ~/Astro/M33    # check the dark and flat matching first
+astro-preprocess ~/Astro/M33
+----
+
+Calibrates, registers and stacks all nights -> `+~/Astro/M33-processed/result_<seconds>s.fit+`.
+
+==== 2. Linear processing
+
+[source,sh]
+----
+astro-linear ~/Astro/M33-processed
+----
+
+Crops, removes the gradient, plate solves, color-calibrates (SPCC) and separates the stars
+with StarNet.
+
+Outputs `+<name>_starless.fit+` and `+<name>_starmask.fit+`, plus JPEG previews to
+check each step.
+
+==== 3. Stretch and finish (by hand)
+
+In Siril, stretch `+<name>_starless.fit+`, add the stars back from `+<name>_starmask.fit+` with
+Star Recomposition, and save the result.
+
+==== 4. Export
+
+[source,sh]
+----
+astro-export ~/Astro/M33-processed/M33_final.fit
+----
+
+Writes a JPEG of the finished image next to it.
+
+== Command reference
+
+The `+--help+` output of each script (generated by `+tools/update-readme+`).
+
+=== planet-stack
+
+[source,text]
+----
+planet-stack: stack selected ASIAIR planetary clips with PlanetarySystemStacker, then RGB-align them.
+
+  planet-stack [options]
+
+Clips are chosen from the ASIAIR sidecar files (<clip>.avi.txt) by exposure and gain.
+PSS always writes results next to its input, so each selected clip is symlinked into the
+output folder first; results land there and the raw folder is left untouched. Each stack
+is then RGB-aligned with PSS's own automatic RGB alignment, as in the GUI.
+
+Output per clip, in the output folder:
+  <clip>_pss.fits       stacked image (16-bit FITS)
+  <clip>_pss_rgb.fits   same, with red/blue channels aligned to green
+
+Defaults match the settings worked out for the 2026-10-22 Saturn session:
+Planet stabilisation, Force Bayer RGGB, 30 px alignment boxes, best 15% of frames.
+
+PlanetarySystemStacker must be importable from this script's Python and its
+PlanetarySystemStacker command on PATH (see the README).
+
+Options:
+      --raw-dir DIR       folder with the .avi clips and .avi.txt sidecars
+                          (default ~/Astro/Saturn)
+  -o, --out-dir DIR       output folder (default ~/Astro/Saturn-processed/batch-<today>)
+      --date PREFIX       only clips whose name starts with this, e.g. 2026-10-22
+      --exposure S        only this exposure in seconds, e.g. 0.015 (default: any)
+      --min-gain N        minimum gain (default 300)
+      --stack-percent N   percent of best frames to stack (default 15)
+      --box N             alignment box width in px (default 30)
+      --debayer MODE      PSS debayering choice (default "Force Bayer RGGB")
+      --rgb-resolution N  RGB alignment precision: 1 = 1 px, 2 = 0.5 px, 4 = 0.25 px
+                          (default 2)
+      --no-rgb            skip RGB alignment
+      --keep-links        keep the clip symlinks in the output folder afterwards
+  -n, --dry-run           only list the selected clips
+  -h, --help              show this help
+
+Examples:
+  planet-stack -n                              # list what would be processed
+  planet-stack                                 # gain >= 300, any exposure, all dates
+  planet-stack --exposure 0.015 --min-gain 300 # only 0.015 s, gain 300 and up
+  planet-stack --date 2026-10-22 --min-gain 252
+----
+
+=== planet-sharpen
+
+[source,text]
+----
+planet-sharpen: crop planetary stacks around the planet and deconvolve them with Siril.
+
+  planet-sharpen [options] DIR
+
+For each input FITS in DIR (by default every *_pss_rgb.fits, i.e. planet-stack output):
+  1. find the planet and compute a crop box of fixed size centred on it
+  2. Siril: load -> crop -> makepsf (manual Gaussian) -> rl (Richardson-Lucy) -> save
+All inputs are processed in one Siril run.
+
+Output: <input name without .fits>_sharpened.fits next to the input (or in --out-dir).
+
+Defaults match the settings tuned on 2026-11-09 (FWHM 5.5, alpha 6000, 15 iterations,
+multiplicative method, Total Variation regularisation, 172x132 crop).
+
+Siril is run headless via siril-cli; the org.siril.Siril flatpak is used if
+siril-cli is not on PATH. Set SIRIL_CLI (or --siril) to override, e.g. SIRIL_CLI="siril-cli".
+
+Options:
+      --pattern GLOB      which files in DIR to process (default *_pss_rgb.fits)
+      --only LIST         comma-separated clip times to include, e.g. 211008,211220
+  -o, --out-dir DIR       write the outputs here instead of next to the inputs
+      --size WxH          crop size (default 172x132)
+      --fwhm N            Gaussian PSF FWHM in px (default 5.5)
+      --alpha N           regularisation strength (default 6000)
+      --iters N           iterations (default 15)
+      --regularization R  tv = Total Variation, fh = Frobenius/Hessian, or none (default tv)
+      --gradient-descent  use gradient descent instead of the multiplicative method
+      --suffix S          output name suffix (default _sharpened)
+      --siril CMD         command that runs siril-cli (default: auto, see above)
+  -n, --dry-run           show the crops and the Siril script, run nothing
+  -f, --force             overwrite existing outputs
+  -h, --help              show this help
+
+Examples:
+  planet-sharpen ~/Astro/Saturn-processed/2026-11-09 --dry-run
+  planet-sharpen ~/Astro/Saturn-processed/2026-11-09
+  planet-sharpen DIR --only 211008,211220,212620 --fwhm 5 --iters 12
+----
+
+=== planet-align
+
+[source,text]
+----
+planet-align: register frames on the planet's centroid and crop them to their common area.
+
+  planet-align [options] -o DIR FILE [FILE ...]
+
+For short-exposure sets where a bright planet dominates the field and there are too few
+stars for Siril's star alignment (e.g. Saturn and its moons). Each frame's planet centroid
+is measured, every frame is shifted by whole pixels so the planet lands where it is in the
+reference frame (the one closest to the median position), and all frames are cropped to the
+area they all cover. Pixel values are copied unchanged (no resampling), so the outputs can
+be stacked in Siril without registration.
+
+Output: aligned_<NNNNN>.fit in DIR, in input order.
+
+Options:
+  -o, --out-dir DIR  folder for the aligned frames (required)
+      --window N     half-size in pixels of the box used to refine the centroid (default 100)
+  -h, --help         show this help
+
+Examples:
+  planet-align -o DIR/aligned DIR/process/pp_cc_light_*.fit
+  planet-align -o out --window 150 frames/*.fit
+----
+
+=== planet-crop
+
+[source,text]
+----
+planet-crop: crop planetary FITS images to a fixed size centred on the planet.
+
+  planet-crop [options] FILE [FILE ...]
+
+Each input is cropped to the same WxH box around the planet's brightness-weighted
+centroid, so images of different sizes (e.g. PSS stacks) become the same size and
+can be stacked together in Siril. Pixel values are copied unchanged (no resampling).
+
+Output: <input name without extension>_crop.fits, next to each input or in --out-dir.
+
+Options:
+      --size WxH     crop size (default 172x132)
+  -o, --out-dir DIR  write the crops here instead of next to each input
+      --suffix S     output name suffix (default _crop)
+  -f, --force        overwrite existing outputs
+  -h, --help         show this help
+
+Examples:
+  planet-crop DIR/*_pss_rgb.fits -o DIR/crop
+  planet-crop a_pss_rgb.fits b_pss_rgb.fits --size 200x150
+----
+
+=== planet-dehalo
+
+[source,text]
+----
+planet-dehalo: subtract the glow around an overexposed planet from a linear image.
+
+  planet-dehalo [options] FILE
+
+For moon shots where the planet is deliberately overexposed. The glow around the planet
+is real scattered light, so stretching makes it grow along with the moons. This measures
+the glow's brightness outward from the planet's centre, separately in angular sectors
+(the glow is stronger along Saturn's rings than across them), using the median of each
+ring segment so the small moons are ignored. It builds a smooth model from that and
+subtracts it from the linear image. The moons, including the inner ones sitting in the
+glow, keep their brightness. FILE is a linear FITS image (mono or RGB); run it before
+any stretch.
+
+The overexposed pixels themselves (planet and ring tips) are left as they are, so the
+planet's position stays visible for lining up the properly exposed planet layer.
+
+Output: <input>_dehalo.fit next to the input (or -o FILE), and with --model the
+subtracted glow as <input>_halo.fit.
+
+Options:
+  -o, --output FILE   output file (default <input>_dehalo.fit)
+      --model         also save the subtracted glow as <input>_halo.fit
+      --sectors N     angular sectors for the glow profile (default 24; 1 = circular)
+      --sat F         fraction of the maximum that counts as overexposed (default 0.9)
+      --ring-width N  width of each ring segment in px (default 2)
+  -h, --help          show this help
+
+Examples:
+  planet-dehalo Saturn-moons_2026-11-09-0_5s_linear.fit
+  planet-dehalo --model --sectors 1 image.fit       # one sector = circular rings
+----
+
+=== astro-preprocess
+
+[source,text]
+----
+astro-preprocess: calibrate, register and stack ASIAIR deep-sky sessions with Siril.
+
+  astro-preprocess [options] [DIR] [SESSION ...]
+
+DIR can be the source target folder or its -processed folder, and defaults to
+the current folder, so the script can be run from either place:
+  ~/Astro/M33             source: session folders containing Light and Flat
+  ~/Astro/M33-processed   output: the source is the same path without -processed
+
+The source folder uses the ASIAIR layout, one folder per session:
+  ~/Astro/M33/2026-11-07/Light/*.fit
+  ~/Astro/M33/2026-11-07/Flat/*.fit
+Darks and biases come from the calibration library (default ~/Astro/Calibration),
+matched on exposure, gain, offset and binning read from the FITS headers. Darks
+are picked per session, closest in sensor temperature to that session's lights,
+so nights shot at different cooler setpoints each get their own matching darks.
+
+Output goes to <target>-processed next to the source (e.g. ~/Astro/M33-processed):
+  <session>/lights, flats, darks, biases   symlinks to the originals, laid out like
+                                           Siril's OSC_Preprocessing working directory
+  <session>/process                        that session's calibrated frames
+  masters/                                 master bias, dark and one flat per session
+  stack/                                   merged and registered sequence
+  preprocess.ssf, logs/                    the generated Siril script and its logs
+  result_<seconds>s.fit                    the final linear stack
+
+Each session is calibrated with its own flats. All sessions are then merged into
+one sequence, registered and stacked together, so pixel rejection works across
+all nights. Originals are never written to: Siril reads them through the links.
+
+SESSION limits the run to the named session folders (e.g. 2026-11-13).
+
+Short-exposure sets with no calibration frames (e.g. Saturn's moons shot as an
+Autorun) use --lights-only: sessions need only a Light folder; hot pixels are
+removed by cosmetic correction instead of darks. Add --separate to stack each
+session on its own (one exposure set per session folder), and --planet when a
+bright planet dominates the field and there are too few stars to align on: frames
+are then aligned on the planet's centroid by planet-align (next to this script)
+instead of by Siril's star alignment.
+
+Siril is run headless via siril-cli; the org.siril.Siril flatpak is used if
+siril-cli is not on PATH. Set SIRIL_CLI to override, e.g. SIRIL_CLI="siril-cli".
+
+Options:
+  -c, --calib DIR      calibration library (default ~/Astro/Calibration)
+  -o, --out-dir DIR    output folder (default <target>-processed)
+      --copy           copy frames instead of symlinking them
+  -p, --prepare-only   build the folders and preprocess.ssf, don't run Siril
+  -n, --dry-run        show what would be linked and matched, change nothing
+  -f, --force          rebuild the session link folders, master frames and stack
+      --lights-only    no darks, flats or biases: cosmetic correction, debayer,
+                       register and stack the lights only
+      --separate       stack each session separately ->
+                       result_<session>_<seconds>s.fit, instead of merging them
+      --planet         align on the planet instead of stars (planet with moons);
+                       implies --separate
+      --no-filter      keep every frame (default drops frames more than 3 sigma
+                       worse than average in roundness or FWHM, i.e. trailed or soft)
+      --temp-tol N     warn when dark and light temperatures differ by more than
+                       N degrees C (default 2)
+      --clean          after a successful stack, delete process/ and stack/
+      --ignore-space   run even if the free disk space looks too small
+  -h, --help           show this help
+
+Examples:
+  astro-preprocess ~/Astro/M33
+  astro-preprocess --lights-only --planet ~/Astro/Saturn-moons
+  astro-preprocess -p ~/Astro/M33 2026-11-13
+  astro-preprocess -n ~/Astro/M33
+  cd ~/Astro/M33 && astro-preprocess 2026-11-13
+  cd ~/Astro/M33-processed && astro-preprocess -f
+----
+
+=== astro-linear
+
+[source,text]
+----
+astro-linear: headless linear processing of a deep-sky stack with Siril.
+
+  astro-linear [options] [DIR | STACK.fit]
+
+DIR can be the -processed folder astro-preprocess writes (e.g. ~/Astro/M33-processed)
+or the source target folder (~/Astro/M33, which maps to ~/Astro/M33-processed), and
+defaults to the current folder. The newest result_*.fit there is used, unless a
+stack file is given. Then it runs the linear steps:
+
+  1. crop      cut a fixed percentage off the edges (field curvature, stacking edges)
+  2. bg        remove the gradient (subsky)                    -> <name>_bg.fit
+  3. solve     plate solve from the FITS header coordinates   (WCS added to _bg)
+  4. color     SPCC (falls back to PCC if SPCC fails), optional green-noise
+               removal and noise reduction                     -> <name>_linear.fit
+  5. stars     StarNet: starless image plus a stars-only image for Star
+               Recomposition                                   -> <name>_starless.fit
+                                                                  <name>_starmask.fit
+
+Every file is still linear. Autostretched JPEG previews are written next to them
+(<name>_bg_preview.jpg, <name>_linear_preview.jpg) so you can check the gradient
+removal and the color balance without opening Siril. The previews use a linked
+stretch, so their color balance is the image's real one.
+
+Each step runs as a separate Siril call and saves its result, so a failure keeps
+everything before it; fix the cause and rerun with --from STEP.
+
+Names for --sensor and --filter must match Siril's SPCC lists exactly (the same
+names as in the SPCC dialog). Spaces in names are fine; quote them on the command line.
+
+Siril is run headless via siril-cli; the org.siril.Siril flatpak is used if
+siril-cli is not on PATH. Set SIRIL_CLI to override, e.g. SIRIL_CLI="siril-cli".
+StarNet must be installed and its location set in Siril's preferences.
+
+Options:
+  -c, --crop PCT        percent of width and height to remove, split evenly between
+                        the two edges (default 20 = 10% per edge; native ED127 field).
+                        Use about 4 with the reducer, 0 to skip.
+  -d, --degree N        polynomial degree for gradient removal (default 1). Low
+                        degrees can't eat into a large galaxy or nebula; use 2 for
+                        a curved gradient.
+      --rbf             use RBF gradient removal instead of a polynomial (flexible,
+                        but can subtract faint halos; check the preview)
+      --samples N       background samples per row (default 20)
+      --sensor NAME     SPCC OSC sensor (default "Sony IMX571")
+      --filter NAME     SPCC OSC filter (default "Optolong L-Pro"; "none" for no filter)
+      --pcc             skip SPCC and use photometric color calibration
+      --no-color        skip plate solving and color calibration (fields with too
+                        few stars to solve, e.g. a planet and its moons)
+      --rmgreen         remove green noise after color calibration
+      --denoise [MOD]   noise reduction on the linear image; MOD 0-1 is the strength
+                        blended in (default 0.6 when given without a value)
+      --dehalo          subtract the glow around an overexposed planet from the linear
+                        image (planet-dehalo, next to this script) -> <name>_dehalo.fit
+                        and <name>_dehalo_preview.jpg; for moon shots
+      --no-starnet      stop after the linear image
+      --from STEP       start at crop, bg, solve, color or stars (default crop)
+  -n, --dry-run         print the Siril scripts, run nothing
+  -h, --help            show this help
+
+Examples:
+  astro-linear ~/Astro/M33-processed
+  cd ~/Astro/M33 && astro-linear
+  astro-linear --filter none --rmgreen ~/Astro/M33-processed
+  astro-linear --from color --pcc ~/Astro/M33-processed
+  astro-linear -c 0 --no-color --no-starnet --dehalo ~/Astro/Saturn-moons-processed/result_2026-11-09-1.0s_120s.fit
+----
+
+=== astro-export
+
+[source,text]
+----
+astro-export: save finished images as JPEG with Siril, optionally enlarged.
+
+  astro-export [options] FILE.fits [FILE.fits ...]
+
+For each input, Siril loads it, runs `resample <scale>` (skipped at scale 1) and
+`savejpg <name> <quality>`.
+The JPEG is named after the capture (date, time, target) and written next to the input:
+  2026-11-09-211008-Saturn-Bin1 56.8F_pss_rgb_finished.fits  ->  2026-11-09-211008-Saturn.jpg
+  (other names: everything from the first space and a trailing _finished are dropped)
+The FITS file itself is never modified.
+
+Siril is run headless via siril-cli; the org.siril.Siril flatpak is used if
+siril-cli is not on PATH. Set SIRIL_CLI to override, e.g. SIRIL_CLI="siril-cli".
+
+Options:
+  -s, --scale N      resample factor (default 1 = original size; use 2 for planets)
+  -q, --quality N    JPEG quality 1-100 (default 95)
+  -o, --out-dir DIR  write the JPEGs here instead of next to each input
+  -f, --force        overwrite existing JPEGs
+  -h, --help         show this help
+
+Examples:
+  astro-export -s 2 ~/Astro/Saturn-processed/2026-11-09/*_finished.fits
+  astro-export ~/Astro/M33-processed/M33_final.fit
+  astro-export -s 1.5 -q 90 image_finished.fits
+----

@@ -1,0 +1,584 @@
+#!/usr/bin/env bash
+#
+# astro-preprocess: calibrate, register and stack ASIAIR deep-sky sessions with Siril.
+#
+#   astro-preprocess [options] [DIR] [SESSION ...]
+#
+# DIR can be the source target folder or its -processed folder, and defaults to
+# the current folder, so the script can be run from either place:
+#   ~/Astro/M33             source: session folders containing Light and Flat
+#   ~/Astro/M33-processed   output: the source is the same path without -processed
+#
+# The source folder uses the ASIAIR layout, one folder per session:
+#   ~/Astro/M33/2026-11-07/Light/*.fit
+#   ~/Astro/M33/2026-11-07/Flat/*.fit
+# Darks and biases come from the calibration library (default ~/Astro/Calibration),
+# matched on exposure, gain, offset and binning read from the FITS headers. Darks
+# are picked per session, closest in sensor temperature to that session's lights,
+# so nights shot at different cooler setpoints each get their own matching darks.
+#
+# Output goes to <target>-processed next to the source (e.g. ~/Astro/M33-processed):
+#   <session>/lights, flats, darks, biases   symlinks to the originals, laid out like
+#                                            Siril's OSC_Preprocessing working directory
+#   <session>/process                        that session's calibrated frames
+#   masters/                                 master bias, dark and one flat per session
+#   stack/                                   merged and registered sequence
+#   preprocess.ssf, logs/                    the generated Siril script and its logs
+#   result_<seconds>s.fit                    the final linear stack
+#
+# Each session is calibrated with its own flats. All sessions are then merged into
+# one sequence, registered and stacked together, so pixel rejection works across
+# all nights. Originals are never written to: Siril reads them through the links.
+#
+# SESSION limits the run to the named session folders (e.g. 2026-11-13).
+#
+# Short-exposure sets with no calibration frames (e.g. Saturn's moons shot as an
+# Autorun) use --lights-only: sessions need only a Light folder; hot pixels are
+# removed by cosmetic correction instead of darks. Add --separate to stack each
+# session on its own (one exposure set per session folder), and --planet when a
+# bright planet dominates the field and there are too few stars to align on: frames
+# are then aligned on the planet's centroid by planet-align (next to this script)
+# instead of by Siril's star alignment.
+#
+# Siril is run headless via siril-cli; the org.siril.Siril flatpak is used if
+# siril-cli is not on PATH. Set SIRIL_CLI to override, e.g. SIRIL_CLI="siril-cli".
+#
+# Options:
+#   -c, --calib DIR      calibration library (default ~/Astro/Calibration)
+#   -o, --out-dir DIR    output folder (default <target>-processed)
+#       --copy           copy frames instead of symlinking them
+#   -p, --prepare-only   build the folders and preprocess.ssf, don't run Siril
+#   -n, --dry-run        show what would be linked and matched, change nothing
+#   -f, --force          rebuild the session link folders, master frames and stack
+#       --lights-only    no darks, flats or biases: cosmetic correction, debayer,
+#                        register and stack the lights only
+#       --separate       stack each session separately ->
+#                        result_<session>_<seconds>s.fit, instead of merging them
+#       --planet         align on the planet instead of stars (planet with moons);
+#                        implies --separate
+#       --no-filter      keep every frame (default drops frames more than 3 sigma
+#                        worse than average in roundness or FWHM, i.e. trailed or soft)
+#       --temp-tol N     warn when dark and light temperatures differ by more than
+#                        N degrees C (default 2)
+#       --clean          after a successful stack, delete process/ and stack/
+#       --ignore-space   run even if the free disk space looks too small
+#   -h, --help           show this help
+#
+# Examples:
+#   astro-preprocess ~/Astro/M33
+#   astro-preprocess --lights-only --planet ~/Astro/Saturn-moons
+#   astro-preprocess -p ~/Astro/M33 2026-11-13
+#   astro-preprocess -n ~/Astro/M33
+#   cd ~/Astro/M33 && astro-preprocess 2026-11-13
+#   cd ~/Astro/M33-processed && astro-preprocess -f
+
+set -euo pipefail
+shopt -s nullglob
+
+calib="$HOME/Astro/Calibration"
+out=""
+copy=0
+prepare_only=0
+dry_run=0
+force=0
+filter=1
+lights_only=0
+separate=0
+planet=0
+temp_tol=2
+clean=0
+ignore_space=0
+target=""
+sessions_wanted=()
+
+usage() { sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; }
+die()   { echo "error: $*" >&2; exit 1; }
+warn()  { echo "  WARNING: $*" >&2; warnings=$((warnings + 1)); }
+warnings=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--calib)        calib="$2"; shift 2 ;;
+    -o|--out-dir|--out) out="$2"; shift 2 ;;
+    --copy)            copy=1; shift ;;
+    -p|--prepare-only) prepare_only=1; shift ;;
+    -n|--dry-run)      dry_run=1; shift ;;
+    -f|--force)        force=1; shift ;;
+    --no-filter)       filter=0; shift ;;
+    --lights-only)     lights_only=1; shift ;;
+    --separate)        separate=1; shift ;;
+    --planet)          planet=1; separate=1; shift ;;
+    --temp-tol)        temp_tol="$2"; shift 2 ;;
+    --clean)           clean=1; shift ;;
+    --ignore-space)    ignore_space=1; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    -*)                echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *)                 if [[ -z "$target" ]]; then target="$1"; else sessions_wanted+=("$1"); fi; shift ;;
+  esac
+done
+
+# A first argument that is a session folder name (or a session path) rather than a
+# target folder means "use the current folder as the target".
+if [[ -n "$target" && ( ! -d "$target" || -d "$target/Light" ) ]]; then
+  sessions_wanted=( "$(basename "$target")" "${sessions_wanted[@]}" )
+  target=""
+fi
+target="${target:-.}"
+[[ -d "$target" ]] || die "folder not found: $target"
+target="$(cd "$target" && pwd)"
+
+# Run from the -processed folder: the source is the same path without the suffix.
+if [[ "$target" == *-processed ]]; then
+  out="${out:-$target}"
+  target="${target%-processed}"
+  [[ -d "$target" ]] || die "source folder for $out not found: $target"
+fi
+src_ok=0; for d in "$target"/*/; do [[ -d "$d/Light" ]] && { src_ok=1; break; }; done
+[[ $src_ok -eq 1 ]] || die "$target isn't a target folder (no session folders with a Light folder) or a -processed folder"
+[[ $lights_only -eq 1 || -d "$calib" ]] || die "calibration folder not found: $calib"
+target="$(cd "$target" && pwd)"
+[[ ! -d "$calib" ]] || calib="$(cd "$calib" && pwd)"
+out="${out:-$target-processed}"
+[[ -d "$(dirname "$out")" ]] || die "parent of the output folder doesn't exist: $(dirname "$out")"
+out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+
+# Siril scripts break on spaces in paths; the frames themselves are linked under
+# simple names, but the output folder has to be space-free too.
+[[ "$out" != *" "* ]] || die "output path contains a space, which Siril scripts can't handle: $out (use -o)"
+
+# ---------------------------------------------------------------- FITS helpers
+
+# fits_key FILE KEY: value of a header keyword, quotes and comment stripped.
+fits_key() {
+  head -c 28800 "$1" | fold -w 80 | grep -a -m1 "^$2 *=" \
+    | sed -E "s/^[^=]*= *//; s| */.*$||; s/'//g; s/ *$//" || true
+}
+
+# exposure token from an ASIAIR file name: "Light_M 33_60.0s_Bin1_..." -> "60.0s"
+exp_token() { [[ "$(basename "$1")" =~ _([0-9.]+m?s)_Bin[0-9] ]] && echo "${BASH_REMATCH[1]}" || echo "?"; }
+
+# night of a capture, from the local timestamp in an ASIAIR name, shifted 12 h so
+# frames after midnight count as the evening before.
+night_of() {
+  [[ "$(basename "$1")" =~ _([0-9]{8})-([0-9]{6})_ ]] || { echo "?"; return; }
+  date -d "${BASH_REMATCH[1]} ${BASH_REMATCH[2]:0:2}:${BASH_REMATCH[2]:2:2} 12 hours ago" +%Y-%m-%d 2>/dev/null || echo "?"
+}
+
+fmt1()    { awk -v a="$1" 'BEGIN { printf "%.1f", a }'; }
+absdiff() { awk -v a="$1" -v b="$2" 'BEGIN { d = a - b; if (d < 0) d = -d; print d }'; }
+num_gt()  { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
+same_num() { awk -v a="$1" -v b="$2" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d < 0.01 * (a > 0 ? a : 1) + 1e-6) }'; }
+
+# pick_dominant DIR PREFIX: prints the most common exposure token among PREFIX_*.fit
+pick_dominant() {
+  local -A count=()
+  local f t best="" n=0
+  for f in "$1"/"$2"_*.fit; do t="$(exp_token "$f")"; count[$t]=$(( ${count[$t]:-0} + 1 )); done
+  for t in "${!count[@]}"; do (( count[$t] > n )) && { n=${count[$t]}; best="$t"; }; done
+  echo "$best"
+}
+
+# find_calib TYPE EXPTIME GAIN OFFSET BIN TEMP: best library folder for this frame type
+# (Dark or Bias). For darks the exposure must match; ties go to the nearest temperature.
+find_calib() {
+  local type="$1" exptime="$2" gain="$3" offset="$4" bin="$5" temp="$6"
+  local d f best="" bestdiff=999 diff
+  local -a files
+  for d in "$calib"/*/; do
+    files=( "$d"*.fit ); [[ ${#files[@]} -gt 0 ]] || continue
+    f="${files[0]}"
+    [[ "$(fits_key "$f" IMAGETYP)" == "$type" ]] || continue
+    [[ "$(fits_key "$f" GAIN)" == "$gain" && "$(fits_key "$f" OFFSET)" == "$offset" ]] || continue
+    [[ "$(fits_key "$f" XBINNING)" == "$bin" ]] || continue
+    if [[ "$type" == Dark ]]; then same_num "$(fits_key "$f" EXPTIME)" "$exptime" || continue; fi
+    diff="$(absdiff "$(fits_key "$f" CCD-TEMP)" "$temp")"
+    if num_gt "$bestdiff" "$diff"; then bestdiff="$diff"; best="${d%/}"; fi
+  done
+  echo "$best"
+}
+
+# ---------------------------------------------------------------- find sessions
+
+sessions=()
+for d in "$target"/*/; do
+  d="${d%/}"
+  [[ -d "$d/Light" ]] || continue
+  if [[ ${#sessions_wanted[@]} -gt 0 ]]; then
+    keep=0; for s in "${sessions_wanted[@]}"; do [[ "$(basename "$d")" == "${s%/}" ]] && keep=1; done
+    [[ $keep -eq 1 ]] || continue
+  fi
+  sessions+=("$d")
+done
+[[ ${#sessions[@]} -gt 0 ]] || die "no session folders with a Light folder found under $target"
+
+echo "Target:       $target"
+echo "Calibration:  $calib"
+echo "Output:       $out"
+echo "Sessions:     ${#sessions[@]}"
+echo
+
+# ---------------------------------------------------------------- plan each session
+
+declare -a s_name s_lexp s_fexp s_exptime s_temp s_dark
+ref_gain=""; ref_offset=""; ref_bin=""; ref_exptime=""; ref_w=""; ref_h=""; ref_temp=""
+total_lights=0
+
+for i in "${!sessions[@]}"; do
+  s="${sessions[$i]}"; name="$(basename "$s")"
+  echo "Session $name"
+  if [[ $lights_only -eq 0 ]]; then
+    [[ -d "$s/Flat" ]] || die "  $name has no Flat folder; every session needs its own flats (or use --lights-only)"
+  fi
+
+  lexp="$(pick_dominant "$s/Light" Light)"
+  fexp=""; [[ $lights_only -eq 1 ]] || fexp="$(pick_dominant "$s/Flat" Flat)"
+  lights=(); others=0
+  for f in "$s/Light"/Light_*.fit; do [[ "$(exp_token "$f")" == "$lexp" ]] && lights+=("$f") || others=$((others + 1)); done
+  [[ $others -eq 0 ]] || warn "$name: skipping $others light(s) not at the main exposure of $lexp"
+  flats=(); fothers=0
+  if [[ $lights_only -eq 0 ]]; then
+    for f in "$s/Flat"/Flat_*.fit; do [[ "$(exp_token "$f")" == "$fexp" ]] && flats+=("$f") || fothers=$((fothers + 1)); done
+  fi
+  [[ $fothers -eq 0 ]] || warn "$name: skipping $fothers flat(s) not at the main flat exposure of $fexp"
+  [[ ${#lights[@]} -gt 0 ]] || die "  $name: no light frames"
+  [[ $lights_only -eq 1 || ${#flats[@]} -gt 0 ]] || die "  $name: no flat frames"
+
+  # one flat set per folder: warn if the lights span more than one night
+  declare -A nights=()
+  for f in "${lights[@]}"; do nights[$(night_of "$f")]=1; done
+  if [[ ${#nights[@]} -gt 1 ]]; then
+    warn "$name: lights span ${#nights[@]} nights ($(echo "${!nights[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')); all of them get this folder's flats. If the camera or focus changed between nights, split them into separate session folders."
+  fi
+  unset nights
+
+  first="${lights[0]}"
+  gain="$(fits_key "$first" GAIN)"; offset="$(fits_key "$first" OFFSET)"
+  bin="$(fits_key "$first" XBINNING)"; exptime="$(fits_key "$first" EXPTIME)"
+  w="$(fits_key "$first" NAXIS1)"; h="$(fits_key "$first" NAXIS2)"; temp="$(fits_key "$first" CCD-TEMP)"
+  if [[ $lights_only -eq 0 ]]; then
+    ffirst="${flats[0]}"
+    [[ "$(fits_key "$ffirst" GAIN)" == "$gain" && "$(fits_key "$ffirst" OFFSET)" == "$offset" ]] \
+      || warn "$name: flats don't share the lights' gain/offset ($gain/$offset)"
+    [[ "$(fits_key "$ffirst" NAXIS1)" == "$w" && "$(fits_key "$ffirst" NAXIS2)" == "$h" ]] \
+      || die "  $name: flat size differs from light size"
+  fi
+
+  if [[ -z "$ref_gain" ]]; then
+    ref_gain="$gain"; ref_offset="$offset"; ref_bin="$bin"; ref_exptime="$exptime"; ref_w="$w"; ref_h="$h"; ref_temp="$temp"
+  else
+    # a shared bias needs matching gain/offset; a merged stack needs matching sizes
+    if [[ $lights_only -eq 0 ]]; then
+      [[ "$gain" == "$ref_gain" && "$offset" == "$ref_offset" && "$bin" == "$ref_bin" ]] \
+        || die "  $name: gain/offset/bin ($gain/$offset/$bin) differ from the first session; process them separately"
+    fi
+    if [[ $separate -eq 0 ]]; then
+      [[ "$w" == "$ref_w" && "$h" == "$ref_h" ]] || die "  $name: frame size differs from the first session (use --separate)"
+    fi
+  fi
+
+  if [[ $lights_only -eq 1 ]]; then
+    printf '  lights: %4d x %s    (lights only)    gain %s, offset %s, %s C\n' \
+      "${#lights[@]}" "$lexp" "$gain" "$offset" "$(fmt1 "$temp")"
+  else
+    printf '  lights: %4d x %s    flats: %3d x %s    gain %s, offset %s, %s C\n' \
+      "${#lights[@]}" "$lexp" "${#flats[@]}" "$fexp" "$gain" "$offset" "$(fmt1 "$temp")"
+  fi
+
+  s_name[$i]="$name"; s_lexp[$i]="$lexp"; s_fexp[$i]="$fexp"; s_exptime[$i]="$exptime"; s_temp[$i]="$temp"
+  total_lights=$((total_lights + ${#lights[@]}))
+done
+echo
+
+# ---------------------------------------------------------------- calibration library
+
+if [[ $lights_only -eq 1 ]]; then
+  echo "Calibration: none (--lights-only); hot pixels removed by cosmetic correction"
+  echo
+else
+  bias_dir="$(find_calib Bias "" "$ref_gain" "$ref_offset" "$ref_bin" "$ref_temp")"
+  [[ -n "$bias_dir" ]] || die "no bias set in $calib matches gain $ref_gain, offset $ref_offset, bin $ref_bin"
+  biases=( "$bias_dir"/*.fit )
+  echo "Biases:  ${#biases[@]} from $bias_dir"
+
+  # Darks per session: same exposure, gain, offset and binning; nearest temperature.
+  declare -A dark_key=()   # dark folder -> master name
+  for i in "${!sessions[@]}"; do
+    d="$(find_calib Dark "${s_exptime[$i]}" "$ref_gain" "$ref_offset" "$ref_bin" "${s_temp[$i]}")"
+    [[ -n "$d" ]] || die "no dark set in $calib matches ${s_exptime[$i]}s, gain $ref_gain, offset $ref_offset, bin $ref_bin (session ${s_name[$i]})"
+    s_dark[$i]="$d"
+    files=( "$d"/*.fit ); dt="$(fits_key "${files[0]}" CCD-TEMP)"
+    printf 'Darks:   %-12s %d from %s (%s C; lights %s C)\n' "${s_name[$i]}" "${#files[@]}" "$d" "$(fmt1 "$dt")" "$(fmt1 "${s_temp[$i]}")"
+    if num_gt "$(absdiff "$dt" "${s_temp[$i]}")" "$temp_tol"; then
+      warn "${s_name[$i]}: nearest darks were shot at $(fmt1 "$dt") C but the lights at $(fmt1 "${s_temp[$i]}") C. Hot pixels and amp glow won't subtract cleanly; shoot a dark set at the lights' setpoint."
+    fi
+    if [[ -z "${dark_key[$d]:-}" ]]; then
+      k="$(basename "$d")"; k="${k//[^A-Za-z0-9_.-]/_}"
+      dark_key[$d]="dark_$k"
+    fi
+  done
+  echo
+fi
+
+# ---------------------------------------------------------------- disk estimate
+
+# Calibrated and registered lights are each debayered 16-bit RGB (W x H x 3 x 2 bytes).
+est_bytes=$(( total_lights * ref_w * ref_h * 6 * 2 ))
+est_gb=$(( est_bytes / 1024 / 1024 / 1024 + 1 ))
+df_dir="$out"; [[ -d "$df_dir" ]] || df_dir="$(dirname "$out")"
+avail_kb="$(df -Pk "$df_dir" 2>/dev/null | awk 'NR==2 { print $4 }')"
+avail_gb=$(( ${avail_kb:-0} / 1024 / 1024 ))
+echo "Disk:    about ${est_gb} GB needed for $total_lights lights, ${avail_gb} GB free on $(df -P "$df_dir" | awk 'NR==2 { print $6 }')"
+if [[ $prepare_only -eq 0 && $dry_run -eq 0 && $ignore_space -eq 0 && $avail_gb -lt $est_gb ]]; then
+  die "not enough free space (use --ignore-space to run anyway)"
+fi
+echo
+
+if [[ $dry_run -eq 1 ]]; then
+  echo "Dry run: nothing written. Warnings: $warnings"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- build link folders
+
+place() { # place SRC DEST
+  if [[ $copy -eq 1 ]]; then cp -p "$1" "$2"; else ln -s "$1" "$2"; fi
+}
+
+# fill_dir DEST PREFIX FILE...: link (or copy) frames in under simple names
+fill_dir() {
+  local dest="$1" prefix="$2"; shift 2
+  if [[ -d "$dest" && $force -eq 1 ]]; then rm -rf "$dest"; fi
+  if [[ -d "$dest" ]] && compgen -G "$dest/*.fit" >/dev/null; then
+    # keep it only if it still holds exactly these frames (e.g. not an old dark set)
+    local want have
+    want="$(printf '%s\n' "$@")"
+    if [[ $copy -eq 1 ]]; then
+      have="$(ls "$dest"/*.fit | wc -l)"; [[ "$have" -eq $# ]] && want="$have"
+    else
+      have="$(for l in "$dest"/*.fit; do readlink "$l"; done)"
+    fi
+    if [[ "$have" == "$want" ]]; then
+      echo "  keep   $dest (exists; -f to rebuild)"; return
+    fi
+    echo "  rebuild $dest (frames changed)"
+    rm -rf "$dest"
+  fi
+  mkdir -p "$dest"
+  local n=0 f
+  for f in "$@"; do n=$((n + 1)); place "$f" "$(printf '%s/%s_%04d.fit' "$dest" "$prefix" "$n")"; done
+  echo "  $( [[ $copy -eq 1 ]] && echo copied || echo linked ) $n -> $dest"
+}
+
+for i in "${!sessions[@]}"; do
+  s="${sessions[$i]}"; sd="$out/${s_name[$i]}"
+  echo "Session ${s_name[$i]}"
+  lights=(); for f in "$s/Light"/Light_*.fit; do [[ "$(exp_token "$f")" == "${s_lexp[$i]}" ]] && lights+=("$f"); done
+  fill_dir "$sd/lights" light "${lights[@]}"
+  if [[ $lights_only -eq 0 ]]; then
+    flats=(); for f in "$s/Flat"/Flat_*.fit; do [[ "$(exp_token "$f")" == "${s_fexp[$i]}" ]] && flats+=("$f"); done
+    fill_dir "$sd/flats"  flat  "${flats[@]}"
+    darks=( "${s_dark[$i]}"/*.fit )
+    fill_dir "$sd/darks"  dark  "${darks[@]}"
+    fill_dir "$sd/biases" bias  "${biases[@]}"
+  fi
+  if [[ $force -eq 1 ]]; then rm -rf "$sd/process"; fi
+done
+echo
+
+# ---------------------------------------------------------------- generate the Siril script
+
+masters="$out/masters"; stackdir="$out/stack"
+if [[ $force -eq 1 ]]; then rm -rf "$masters" "$stackdir"; fi
+mkdir -p "$masters/process" "$stackdir" "$out/logs"
+s0="$out/${s_name[0]}"
+
+ssf="$out/preprocess.ssf"
+{
+  echo "# Generated by astro-preprocess on $(date '+%Y-%m-%d %H:%M')"
+  echo "# Target $target, sessions: ${s_name[*]}"
+  echo "requires 1.2.0"
+  echo "setext fit"
+  echo "set16bits"
+  echo
+  if [[ $lights_only -eq 0 ]]; then
+    echo "# Master bias, shared by all sessions"
+    echo "cd $s0/biases"
+    echo "convert bias -out=$masters/process"
+    echo "cd $masters/process"
+    echo "stack bias rej 3 3 -nonorm -out=$masters/bias_stacked"
+    # one master dark per dark set, built from the first session that uses it
+    declare -A built=()
+    for i in "${!sessions[@]}"; do
+      key="${dark_key[${s_dark[$i]}]}"
+      [[ -z "${built[$key]:-}" ]] || continue
+      built[$key]=1
+      echo
+      echo "# Master dark $key ($(basename "${s_dark[$i]}"))"
+      echo "cd $out/${s_name[$i]}/darks"
+      echo "convert dark -out=$masters/process"
+      echo "cd $masters/process"
+      echo "stack dark rej 3 3 -nonorm -out=$masters/$key"
+    done
+  fi
+  for i in "${!sessions[@]}"; do
+    sd="$out/${s_name[$i]}"
+    echo
+    if [[ $lights_only -eq 1 ]]; then
+      echo "# Session ${s_name[$i]}: cosmetic correction (no darks), then debayer the lights"
+      echo "cd $sd/lights"
+      echo "convert light -out=$sd/process"
+      echo "cd $sd/process"
+      echo "seqfind_cosme_cfa light 3 3"
+      echo "calibrate cc_light -debayer -prefix=pp_"
+    else
+      echo "# Session ${s_name[$i]}: master flat, then calibrate and debayer the lights"
+      echo "cd $sd/flats"
+      echo "convert flat -out=$sd/process"
+      echo "cd $sd/process"
+      echo "calibrate flat -bias=$masters/bias_stacked"
+      echo "stack pp_flat rej 3 3 -norm=mul -out=$masters/pflat_${s_name[$i]}"
+      echo "cd $sd/lights"
+      echo "convert light -out=$sd/process"
+      echo "cd $sd/process"
+      echo "calibrate light -dark=$masters/${dark_key[${s_dark[$i]}]} -flat=$masters/pflat_${s_name[$i]} -cc=dark -cfa -equalize_cfa -debayer"
+    fi
+  done
+  # calibrated sequence name in each session's process folder
+  if [[ $lights_only -eq 1 ]]; then pseq="pp_cc_light"; else pseq="pp_light"; fi
+  reg_opts="-2pass"
+  apply_opts=""; [[ $filter -eq 0 ]] || apply_opts=" -filter-round=3k -filter-wfwhm=3k"
+  register_and_stack() { # register_and_stack SEQ OUTPUT
+    echo "register $1 $reg_opts"
+    echo "seqapplyreg $1$apply_opts"
+    echo "set32bits"
+    echo "stack r_$1 rej 3 3 -norm=addscale -output_norm -rgb_equal -out=$2"
+    echo "set16bits"
+  }
+  echo
+  if [[ $planet -eq 1 ]]; then
+    echo "# Next: planet-align aligns each session on the planet, then stack.ssf stacks them"
+  elif [[ $separate -eq 1 ]]; then
+    for i in "${!sessions[@]}"; do
+      echo "# Register and stack session ${s_name[$i]} on its own"
+      echo "cd $out/${s_name[$i]}/process"
+      register_and_stack "$pseq" "$stackdir/result_${s_name[$i]}"
+      echo
+    done
+  else
+    echo "# Register and stack all sessions together"
+    echo "cd $stackdir"
+    if [[ ${#sessions[@]} -gt 1 ]]; then
+      merge_args=""
+      for i in "${!sessions[@]}"; do merge_args+=" $out/${s_name[$i]}/process/$pseq"; done
+      echo "merge$merge_args lights"
+      seq="lights"
+    else
+      echo "cd $out/${s_name[0]}/process"
+      seq="$pseq"
+    fi
+    register_and_stack "$seq" "$stackdir/result"
+  fi
+} > "$ssf"
+echo "Wrote $ssf"
+
+if [[ $prepare_only -eq 1 ]]; then
+  echo "Prepare only: run it with  siril-cli -d $out -s $ssf"
+  [[ $planet -eq 0 ]] || echo "(--planet: the alignment and stacking steps run only in a full run)"
+  echo "Each session folder can also be opened in Siril and run with the stock OSC_Preprocessing script."
+  [[ $warnings -eq 0 ]] || echo "Warnings: $warnings (see above)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- run Siril
+
+if [[ -n "${SIRIL_CLI:-}" ]]; then
+  read -r -a siril <<< "$SIRIL_CLI"
+elif command -v siril-cli >/dev/null 2>&1; then
+  siril=(siril-cli)
+elif command -v flatpak >/dev/null 2>&1; then
+  siril=(flatpak run --command=siril-cli org.siril.Siril)
+else
+  die "siril-cli not found (neither on PATH nor as the org.siril.Siril flatpak)."
+fi
+
+# run_siril SSF NAME: run a Siril script, logging to logs/NAME-<time>.log
+run_siril() {
+  log="$out/logs/$2-$(date +%Y%m%d-%H%M%S).log"
+  echo "Running Siril ($2); this takes a while. Log: $log"
+  echo
+  if ! "${siril[@]}" -d "$out" -s "$1" 2>&1 | tee "$log"; then
+    echo >&2
+    echo "Siril failed; see $log" >&2
+    exit 1
+  fi
+}
+
+run_siril "$ssf" preprocess
+
+if [[ $planet -eq 1 ]]; then
+  if [[ -n "${PLANET_ALIGN:-}" ]]; then
+    read -r -a palign <<< "$PLANET_ALIGN"
+  else
+    palign=("$(dirname "$(readlink -f "$0")")/planet-align")
+  fi
+  [[ -x "${palign[0]}" ]] || command -v "${palign[0]}" >/dev/null 2>&1 \
+    || die "planet-align not found next to this script (set PLANET_ALIGN to override)"
+  sssf="$out/stack.ssf"
+  {
+    echo "# Generated by astro-preprocess: stack the planet-aligned frames"
+    echo "requires 1.2.0"
+    echo "setext fit"
+    echo "set32bits"
+  } > "$sssf"
+  for i in "${!sessions[@]}"; do
+    sd="$out/${s_name[$i]}"
+    echo
+    echo "== planet-align ${s_name[$i]}"
+    frames=( "$sd/process/${pseq}_"*.fit )
+    [[ ${#frames[@]} -gt 0 ]] || die "no calibrated frames in $sd/process"
+    "${palign[@]}" -o "$sd/aligned" "${frames[@]}" || die "planet-align failed for ${s_name[$i]}"
+    rm -f "$sd/process/al_"*.fit "$sd/process/al_.seq"
+    {
+      echo
+      echo "# Session ${s_name[$i]}"
+      echo "cd $sd/aligned"
+      echo "convert al -out=$sd/process"
+      echo "cd $sd/process"
+      echo "stack al rej 3 3 -norm=addscale -output_norm -rgb_equal -out=$stackdir/result_${s_name[$i]}"
+    } >> "$sssf"
+  done
+  echo
+  run_siril "$sssf" stack
+fi
+
+# finish_stack FILE PREFIX EXPTIME: rename a stack after its total exposure
+finish_stack() {
+  local result="$1" live cnt final
+  [[ -f "$result" ]] || die "Siril finished but $result is missing; see $log"
+  live="$(fits_key "$result" LIVETIME)"
+  if [[ -z "$live" ]]; then
+    cnt="$(fits_key "$result" STACKCNT)"
+    live="$(awk -v c="${cnt:-0}" -v e="$3" 'BEGIN { print c * e }')"
+  fi
+  final="$out/$2$(printf '%.0f' "$live")s.fit"
+  mv -f "$result" "$final"
+  echo "Stack: $final"
+}
+
+echo
+if [[ $separate -eq 1 ]]; then
+  for i in "${!sessions[@]}"; do
+    finish_stack "$stackdir/result_${s_name[$i]}.fit" "result_${s_name[$i]}_" "${s_exptime[$i]}"
+  done
+else
+  finish_stack "$stackdir/result.fit" "result_" "$ref_exptime"
+fi
+
+if [[ $clean -eq 1 ]]; then
+  for i in "${!sessions[@]}"; do rm -rf "$out/${s_name[$i]}/process" "$out/${s_name[$i]}/aligned"; done
+  rm -rf "$stackdir" "$masters/process"
+  echo "Removed intermediate frames (process/ and stack/)."
+else
+  echo "Intermediate frames kept in */process and stack/ ($(du -sh "$out" 2>/dev/null | cut -f1) total); rerun with --clean or delete them when done."
+fi
+[[ $warnings -eq 0 ]] || echo "Warnings: $warnings (see above)"

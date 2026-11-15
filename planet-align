@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""
+planet-align: register frames on the planet's centroid and crop them to their common area.
+
+  planet-align [options] -o DIR FILE [FILE ...]
+
+For short-exposure sets where a bright planet dominates the field and there are too few
+stars for Siril's star alignment (e.g. Saturn and its moons). Each frame's planet centroid
+is measured, every frame is shifted by whole pixels so the planet lands where it is in the
+reference frame (the one closest to the median position), and all frames are cropped to the
+area they all cover. Pixel values are copied unchanged (no resampling), so the outputs can
+be stacked in Siril without registration.
+
+Output: aligned_<NNNNN>.fit in DIR, in input order.
+
+Options:
+  -o, --out-dir DIR  folder for the aligned frames (required)
+      --window N     half-size in pixels of the box used to refine the centroid (default 100)
+  -h, --help         show this help
+
+Examples:
+  planet-align -o DIR/aligned DIR/process/pp_cc_light_*.fit
+  planet-align -o out --window 150 frames/*.fit
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+from astropy.io import fits
+
+
+def luminance(data: np.ndarray) -> np.ndarray:
+    lum = data.astype(np.float32)
+    return lum.mean(axis=0) if lum.ndim == 3 else lum
+
+
+def planet_centroid(lum: np.ndarray, window: int, binning: int = 8):
+    """(y, x) of the planet: coarse peak on a binned image, then a weighted centroid
+    of the bright pixels in a window around it. Binning dilutes small moons and stars,
+    so the coarse peak lands on the planet, the largest bright object."""
+    h, w = lum.shape
+    hb, wb = h // binning, w // binning
+    binned = lum[: hb * binning, : wb * binning].reshape(hb, binning, wb, binning).mean((1, 3))
+    py, px = np.unravel_index(int(np.argmax(binned)), binned.shape)
+    cy, cx = (py + 0.5) * binning, (px + 0.5) * binning
+    y0, y1 = max(0, int(cy - window)), min(h, int(cy + window))
+    x0, x1 = max(0, int(cx - window)), min(w, int(cx + window))
+    win = lum[y0:y1, x0:x1]
+    bg = float(np.median(win))
+    mask = win > bg + 0.5 * (float(win.max()) - bg)
+    ys, xs = np.nonzero(mask)
+    wts = win[mask] - bg
+    return y0 + float((ys * wts).sum() / wts.sum()), x0 + float((xs * wts).sum() / wts.sum())
+
+
+def main():
+    ap = argparse.ArgumentParser(usage="%(prog)s [options] -o DIR FILE [FILE ...]")
+    ap.format_help = lambda: __doc__  # --help prints the docstring
+    ap.add_argument("files", nargs="+", type=Path, metavar="FILE")
+    ap.add_argument("-o", "--out-dir", type=Path, required=True)
+    ap.add_argument("--window", type=int, default=100)
+    args = ap.parse_args()
+
+    files = sorted(args.files)
+    if not files:
+        sys.exit("no input frames")
+
+    cents = []
+    shape = None
+    for f in files:
+        data = fits.getdata(f)
+        if shape is None:
+            shape = data.shape
+        elif data.shape != shape:
+            sys.exit(f"{f.name}: size {data.shape} differs from {shape}")
+        cents.append(planet_centroid(luminance(data), args.window))
+    cents = np.array(cents)
+
+    med = np.median(cents, axis=0)
+    ref = int(np.argmin(np.hypot(*(cents - med).T)))
+    shifts = np.rint(cents[ref] - cents).astype(int)  # (dy, dx) to move each frame onto the reference
+    h, w = shape[-2:]
+    y0, y1 = max(0, shifts[:, 0].max()), min(h, h + shifts[:, 0].min())
+    x0, x1 = max(0, shifts[:, 1].max()), min(w, w + shifts[:, 1].min())
+    if y1 - y0 < 50 or x1 - x0 < 50:
+        sys.exit(f"common area too small ({x1 - x0}x{y1 - y0}); the planet moved too far between frames")
+
+    jumps = np.hypot(*np.diff(cents, axis=0).T)
+    print(f"{len(files)} frames, reference #{ref + 1}; planet moved {np.ptp(cents[:, 1]):.0f} px in x, "
+          f"{np.ptp(cents[:, 0]):.0f} px in y; largest jump between frames {jumps.max() if len(jumps) else 0:.1f} px")
+    print(f"common area {x1 - x0}x{y1 - y0} of {w}x{h}")
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    for old in args.out_dir.glob("aligned_*.fit"):
+        old.unlink()
+    for i, (f, (dy, dx)) in enumerate(zip(files, shifts), 1):
+        with fits.open(f) as hdul:
+            hdu = hdul[0]
+            data = hdu.data
+            cut = data[..., y0 - dy: y1 - dy, x0 - dx: x1 - dx]
+            hdr = hdu.header.copy()
+            hdr.add_history(f"planet-align: shift dx={dx} dy={dy}, crop x={x0}..{x1} y={y0}..{y1}")
+            fits.PrimaryHDU(cut, hdr).writeto(args.out_dir / f"aligned_{i:05d}.fit", overwrite=True)
+    print(f"wrote {len(files)} frames to {args.out_dir}")
+
+
+if __name__ == "__main__":
+    main()

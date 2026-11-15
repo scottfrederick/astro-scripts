@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+planet-crop: crop planetary FITS images to a fixed size centred on the planet.
+
+  planet-crop [options] FILE [FILE ...]
+
+Each input is cropped to the same WxH box around the planet's brightness-weighted
+centroid, so images of different sizes (e.g. PSS stacks) become the same size and
+can be stacked together in Siril. Pixel values are copied unchanged (no resampling).
+
+Output: <input name without extension>_crop.fits, next to each input or in --out-dir.
+
+Options:
+      --size WxH     crop size (default 172x132)
+  -o, --out-dir DIR  write the crops here instead of next to each input
+      --suffix S     output name suffix (default _crop)
+  -f, --force        overwrite existing outputs
+  -h, --help         show this help
+
+Examples:
+  planet-crop DIR/*_pss_rgb.fits -o DIR/crop
+  planet-crop a_pss_rgb.fits b_pss_rgb.fits --size 200x150
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+from astropy.io import fits
+
+
+def crop_box(lum: np.ndarray, width: int, height: int):
+    """Return (row0, col0, h, w) in array coordinates, centred on the planet."""
+    img_h, img_w = lum.shape
+    mask = lum > lum.max() * 0.3
+    ys, xs = np.nonzero(mask)
+    weights = lum[mask]
+    cy = float((ys * weights).sum() / weights.sum())
+    cx = float((xs * weights).sum() / weights.sum())
+    h, w = min(height, img_h), min(width, img_w)
+    r0 = max(0, min(int(round(cy - h / 2)), img_h - h))
+    c0 = max(0, min(int(round(cx - w / 2)), img_w - w))
+    extent = (int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
+    return r0, c0, h, w, extent
+
+
+def main():
+    p = argparse.ArgumentParser(usage="%(prog)s [options] FILE [FILE ...]")
+    p.format_help = lambda: __doc__  # --help prints the docstring
+    p.add_argument("files", nargs="+", type=Path, metavar="FILE")
+    p.add_argument("--size", default="172x132")
+    p.add_argument("-o", "--out-dir", type=Path, default=None)
+    p.add_argument("--suffix", default="_crop")
+    p.add_argument("-f", "--force", action="store_true")
+    args = p.parse_args()
+
+    width, height = (int(v) for v in args.size.lower().split("x"))
+    if args.out_dir:
+        args.out_dir.expanduser().mkdir(parents=True, exist_ok=True)
+
+    failures = 0
+    for src in args.files:
+        src = src.expanduser()
+        if not src.is_file():
+            print(f"  skip (not found): {src}")
+            failures += 1
+            continue
+        out_dir = args.out_dir.expanduser() if args.out_dir else src.parent
+        out = out_dir / f"{src.stem}{args.suffix}.fits"
+        if out.exists() and not args.force:
+            print(f"  skip (exists, use -f to overwrite): {out.name}")
+            continue
+
+        with fits.open(src) as hdul:
+            hdu = hdul[0]
+            data = hdu.data
+            header = hdu.header.copy()
+        lum = data.astype(np.float32).mean(axis=0) if data.ndim == 3 else data.astype(np.float32)
+        r0, c0, h, w, extent = crop_box(lum, width, height)
+        cropped = np.ascontiguousarray(data[..., r0:r0 + h, c0:c0 + w])
+
+        # keep descriptive keywords; let astropy rewrite the structural ones
+        for key in ("SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "NAXIS3",
+                    "EXTEND", "BZERO", "BSCALE"):
+            header.remove(key, ignore_missing=True, remove_all=True)
+        new = fits.PrimaryHDU(cropped, header=header)
+        new.header.add_history(f"planet-crop: {w}x{h} at x={c0}, row={r0} "
+                               f"(FITS array coords) from {lum.shape[1]}x{lum.shape[0]}")
+        new.writeto(out, overwrite=True)
+        print(f"  {src.name}: planet {extent[0]}x{extent[1]} px -> {out.name} ({w}x{h})")
+
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()

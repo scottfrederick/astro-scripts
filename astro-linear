@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+#
+# astro-linear: headless linear processing of a deep-sky stack with Siril.
+#
+#   astro-linear [options] [DIR | STACK.fit]
+#
+# DIR can be the -processed folder astro-preprocess writes (e.g. ~/Astro/M33-processed)
+# or the source target folder (~/Astro/M33, which maps to ~/Astro/M33-processed), and
+# defaults to the current folder. The newest result_*.fit there is used, unless a
+# stack file is given. Then it runs the linear steps:
+#
+#   1. crop      cut a fixed percentage off the edges (field curvature, stacking edges)
+#   2. bg        remove the gradient (subsky)                    -> <name>_bg.fit
+#   3. solve     plate solve from the FITS header coordinates   (WCS added to _bg)
+#   4. color     SPCC (falls back to PCC if SPCC fails), optional green-noise
+#                removal and noise reduction                     -> <name>_linear.fit
+#   5. stars     StarNet: starless image plus a stars-only image for Star
+#                Recomposition                                   -> <name>_starless.fit
+#                                                                   <name>_starmask.fit
+#
+# Every file is still linear. Autostretched JPEG previews are written next to them
+# (<name>_bg_preview.jpg, <name>_linear_preview.jpg) so you can check the gradient
+# removal and the color balance without opening Siril. The previews use a linked
+# stretch, so their color balance is the image's real one.
+#
+# Each step runs as a separate Siril call and saves its result, so a failure keeps
+# everything before it; fix the cause and rerun with --from STEP.
+#
+# Names for --sensor and --filter must match Siril's SPCC lists exactly (the same
+# names as in the SPCC dialog). Spaces in names are fine; quote them on the command line.
+#
+# Siril is run headless via siril-cli; the org.siril.Siril flatpak is used if
+# siril-cli is not on PATH. Set SIRIL_CLI to override, e.g. SIRIL_CLI="siril-cli".
+# StarNet must be installed and its location set in Siril's preferences.
+#
+# Options:
+#   -c, --crop PCT        percent of width and height to remove, split evenly between
+#                         the two edges (default 20 = 10% per edge; native ED127 field).
+#                         Use about 4 with the reducer, 0 to skip.
+#   -d, --degree N        polynomial degree for gradient removal (default 1). Low
+#                         degrees can't eat into a large galaxy or nebula; use 2 for
+#                         a curved gradient.
+#       --rbf             use RBF gradient removal instead of a polynomial (flexible,
+#                         but can subtract faint halos; check the preview)
+#       --samples N       background samples per row (default 20)
+#       --sensor NAME     SPCC OSC sensor (default "Sony IMX571")
+#       --filter NAME     SPCC OSC filter (default "Optolong L-Pro"; "none" for no filter)
+#       --pcc             skip SPCC and use photometric color calibration
+#       --no-color        skip plate solving and color calibration (fields with too
+#                         few stars to solve, e.g. a planet and its moons)
+#       --rmgreen         remove green noise after color calibration
+#       --denoise [MOD]   noise reduction on the linear image; MOD 0-1 is the strength
+#                         blended in (default 0.6 when given without a value)
+#       --dehalo          subtract the glow around an overexposed planet from the linear
+#                         image (planet-dehalo, next to this script) -> <name>_dehalo.fit
+#                         and <name>_dehalo_preview.jpg; for moon shots
+#       --no-starnet      stop after the linear image
+#       --from STEP       start at crop, bg, solve, color or stars (default crop)
+#   -n, --dry-run         print the Siril scripts, run nothing
+#   -h, --help            show this help
+#
+# Examples:
+#   astro-linear ~/Astro/M33-processed
+#   cd ~/Astro/M33 && astro-linear
+#   astro-linear --filter none --rmgreen ~/Astro/M33-processed
+#   astro-linear --from color --pcc ~/Astro/M33-processed
+#   astro-linear -c 0 --no-color --no-starnet --dehalo ~/Astro/Saturn-moons-processed/result_2026-11-09-1.0s_120s.fit
+
+set -euo pipefail
+shopt -s nullglob
+
+crop=20
+degree=1
+rbf=0
+samples=20
+sensor="Sony IMX571"
+filter="Optolong L-Pro"
+use_pcc=0
+no_color=0
+dehalo=0
+rmgreen=0
+denoise=""
+starnet=1
+from="crop"
+dry_run=0
+input=""
+
+usage() { sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; }
+die()   { echo "error: $*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--crop)     crop="$2"; shift 2 ;;
+    -d|--degree)   degree="$2"; shift 2 ;;
+    --rbf)         rbf=1; shift ;;
+    --samples)     samples="$2"; shift 2 ;;
+    --sensor)      sensor="$2"; shift 2 ;;
+    --filter)      filter="$2"; shift 2 ;;
+    --pcc)         use_pcc=1; shift ;;
+    --no-color)    no_color=1; shift ;;
+    --dehalo)      dehalo=1; shift ;;
+    --rmgreen)     rmgreen=1; shift ;;
+    --denoise)     if [[ "${2:-}" =~ ^[0-9.]+$ ]]; then denoise="$2"; shift 2; else denoise="0.6"; shift; fi ;;
+    --no-starnet)  starnet=0; shift ;;
+    --from)        from="$2"; shift 2 ;;
+    -n|--dry-run)  dry_run=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    -*)            echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *)             input="$1"; shift ;;
+  esac
+done
+
+input="${input:-.}"
+case "$from" in crop|bg|solve|color|stars) ;; *) die "--from must be crop, bg, solve, color or stars" ;; esac
+[[ "$crop" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v c="$crop" 'BEGIN { exit !(c >= 0 && c < 90) }' \
+  || die "--crop must be a percentage between 0 and 90"
+
+# ---------------------------------------------------------------- locate the stack
+
+if [[ -d "$input" ]]; then
+  dir="$(cd "$input" && pwd)"
+  if [[ "$dir" != *-processed ]]; then
+    src_ok=0; for d in "$dir"/*/; do [[ -d "$d/Light" ]] && { src_ok=1; break; }; done
+    [[ $src_ok -eq 1 ]] || die "$dir isn't a -processed folder or a target folder with session folders"
+    [[ -d "$dir-processed" ]] || die "$dir-processed not found (run astro-preprocess first)"
+    dir="$dir-processed"
+  fi
+  stacks=( "$dir"/result_*.fit )
+  [[ ${#stacks[@]} -gt 0 ]] || die "no result_*.fit in $dir (run astro-preprocess first)"
+  stack="$(ls -t "${stacks[@]}" | head -n1)"
+else
+  [[ -f "$input" ]] || die "not found: $input"
+  dir="$(cd "$(dirname "$input")" && pwd)"
+  stack="$dir/$(basename "$input")"
+fi
+[[ "$dir" != *" "* ]] || die "path contains a space, which Siril scripts can't handle: $dir"
+
+# Output names start with the target: M33-processed -> M33. A per-session stack
+# from astro-preprocess --separate (result_<session>_<seconds>s.fit) adds the session.
+name="$(basename "$dir")"; name="${name%-processed}"; name="${name// /_}"
+if [[ "$(basename "$stack" .fit)" =~ ^result_(.+)_[0-9]+s$ ]]; then name="${name}_${BASH_REMATCH[1]}"; fi
+# Siril reads anything after a dot in a name as a file extension (0.5s -> ".5s"),
+# so the names it loads and saves must not contain dots.
+name="${name//./_}"
+
+fits_key() {
+  head -c 28800 "$1" | fold -w 80 | grep -a -m1 "^$2 *=" \
+    | sed -E "s/^[^=]*= *//; s| */.*$||; s/'//g; s/ *$//" || true
+}
+
+echo "Stack:   $stack"
+echo "Outputs: $dir/${name}_*.fit"
+echo
+
+# ---------------------------------------------------------------- Siril
+
+if [[ -n "${SIRIL_CLI:-}" ]]; then
+  read -r -a siril <<< "$SIRIL_CLI"
+elif command -v siril-cli >/dev/null 2>&1; then
+  siril=(siril-cli)
+elif command -v flatpak >/dev/null 2>&1; then
+  siril=(flatpak run --command=siril-cli org.siril.Siril)
+else
+  [[ $dry_run -eq 1 ]] || die "siril-cli not found (neither on PATH nor as the org.siril.Siril flatpak)."
+fi
+
+mkdir -p "$dir/logs"
+
+# run_step STEP: run the Siril script on stdin for STEP; returns Siril's status
+run_step() {
+  local step="$1" ssf="$dir/logs/linear-$1.ssf" log
+  { echo "requires 1.2.0"; echo "setext fit"; cat; } > "$ssf"
+  if [[ $dry_run -eq 1 ]]; then
+    echo "---- $step"; cat "$ssf"; echo; return 0
+  fi
+  log="$dir/logs/linear-$step-$(date +%Y%m%d-%H%M%S).log"
+  echo "== $step"
+  if "${siril[@]}" -d "$dir" -s "$ssf" >"$log" 2>&1; then
+    return 0
+  fi
+  echo "   Siril failed in step '$step'; last lines of $log:" >&2
+  tail -n 15 "$log" | sed 's/^/   /' >&2
+  return 1
+}
+
+need() { [[ $dry_run -eq 1 || -f "$dir/$1.fit" ]] || die "$1.fit is missing; run the earlier steps first"; }
+
+order=(crop bg solve color stars)
+should_run() { # should_run STEP: true if STEP is at or after --from
+  local s started=0
+  for s in "${order[@]}"; do
+    [[ "$s" == "$from" ]] && started=1
+    [[ "$s" == "$1" ]] && { [[ $started -eq 1 ]]; return; }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- 1-2. crop and gradient
+
+# crop and bg are one Siril call; --from bg reuses an existing _crop file.
+if should_run crop || should_run bg; then
+  if should_run crop; then
+    w="$(fits_key "$stack" NAXIS1)"; h="$(fits_key "$stack" NAXIS2)"
+    [[ -n "$w" && -n "$h" ]] || die "can't read the image size from $stack"
+    read -r cx cy cw ch < <(awk -v w="$w" -v h="$h" -v c="$crop" \
+      'BEGIN { mx = int(w * c / 200); my = int(h * c / 200); print mx, my, w - 2 * mx, h - 2 * my }')
+    echo "Crop:    ${w}x${h} -> ${cw}x${ch} (${crop}%)"
+  fi
+  if [[ $rbf -eq 1 ]]; then sky="subsky -rbf -samples=$samples"; else sky="subsky $degree -samples=$samples"; fi
+  if should_run crop; then
+    # the stack is linked in under a fixed name so its own name can't confuse Siril
+    [[ $dry_run -eq 1 ]] || ln -sfn "$stack" "$dir/${name}_input.fit"
+  else
+    need "${name}_crop"
+  fi
+  {
+    if should_run crop; then
+      echo "load ${name}_input"
+      [[ "$crop" == 0 ]] || echo "crop $cx $cy $cw $ch"
+      echo "save ${name}_crop"
+    else
+      echo "load ${name}_crop"
+    fi
+    echo "$sky"
+    echo "save ${name}_bg"
+    echo "autostretch -linked"
+    echo "savejpg ${name}_bg_preview 90"
+  } | run_step bg || { rm -f "$dir/${name}_input.fit"; exit 1; }
+  rm -f "$dir/${name}_input.fit"
+fi
+
+# ---------------------------------------------------------------- 3. plate solve
+
+if should_run solve && [[ $no_color -eq 0 ]]; then
+  need "${name}_bg"
+  printf 'load %s\nplatesolve\nsave %s\n' "${name}_bg" "${name}_bg" | run_step solve || {
+    echo "   Check that FOCALLEN in the header is right (952 native, 666 with the reducer)," >&2
+    echo "   and that Siril can reach its star catalogs." >&2
+    exit 1
+  }
+fi
+
+# ---------------------------------------------------------------- 4. color
+
+color_script() { # color_script CALIBRATION_COMMAND
+  echo "load ${name}_bg"
+  [[ -z "$1" ]] || echo "$1"
+  [[ $rmgreen -eq 0 ]] || echo "rmgreen"
+  [[ -z "$denoise" ]] || echo "denoise -mod=$denoise"
+  echo "save ${name}_linear"
+  echo "autostretch -linked"
+  echo "savejpg ${name}_linear_preview 90"
+}
+
+if should_run color; then
+  need "${name}_bg"
+  spcc_cmd="spcc \"-oscsensor=$sensor\""
+  [[ "${filter,,}" == none ]] || spcc_cmd+=" \"-oscfilter=$filter\""
+  if [[ $no_color -eq 1 ]]; then
+    color_script "" | run_step color || exit 1
+    [[ $dry_run -eq 1 ]] || echo "   color calibration: skipped (--no-color)"
+  elif [[ $use_pcc -eq 1 ]]; then
+    color_script "pcc" | run_step color || exit 1
+    [[ $dry_run -eq 1 ]] || echo "   color calibration: PCC"
+  elif color_script "$spcc_cmd" | run_step color; then
+    [[ $dry_run -eq 1 ]] || echo "   color calibration: SPCC ($sensor, filter: $filter)"
+  else
+    echo "   SPCC failed (often a sensor or filter name that doesn't match Siril's list exactly)." >&2
+    echo "   Falling back to PCC." >&2
+    color_script "pcc" | run_step color-pcc || exit 1
+    [[ $dry_run -eq 1 ]] || echo "   color calibration: PCC (fallback)"
+  fi
+fi
+
+# ---------------------------------------------------------------- 4b. dehalo
+
+if [[ $dehalo -eq 1 ]] && should_run color; then
+  need "${name}_linear"
+  if [[ -n "${PLANET_DEHALO:-}" ]]; then
+    read -r -a pdehalo <<< "$PLANET_DEHALO"
+  else
+    pdehalo=("$(dirname "$(readlink -f "$0")")/planet-dehalo")
+  fi
+  if [[ $dry_run -eq 1 ]]; then
+    echo "---- dehalo"; echo "${pdehalo[*]} -o $dir/${name}_dehalo.fit $dir/${name}_linear.fit"; echo
+  else
+    echo "== dehalo"
+    "${pdehalo[@]}" -o "$dir/${name}_dehalo.fit" "$dir/${name}_linear.fit" | sed 's/^/   /' \
+      || die "planet-dehalo failed"
+  fi
+  printf 'load %s\nautostretch -linked\nsavejpg %s 90\n' "${name}_dehalo" "${name}_dehalo_preview" \
+    | run_step dehalo-preview || exit 1
+fi
+
+# ---------------------------------------------------------------- 5. stars
+
+if [[ $starnet -eq 1 ]] && should_run stars; then
+  need "${name}_linear"
+  {
+    echo "load ${name}_linear"
+    echo "starnet -stretch -nostarmask"
+    echo "save ${name}_starless"
+    # stars only = linear image minus starless, what Star Recomposition wants
+    echo "load ${name}_linear"
+    echo "isub ${name}_starless"
+    echo "save ${name}_starmask"
+  } | run_step stars || {
+    echo "   Is StarNet installed and its location set in Siril's preferences?" >&2
+    exit 1
+  }
+  # StarNet also writes its own copy of the starless image; it duplicates _starless
+  [[ $dry_run -eq 1 ]] || rm -f "$dir/starless_${name}_linear.fit"
+fi
+
+[[ $dry_run -eq 1 ]] && exit 0
+
+# ---------------------------------------------------------------- summary
+
+echo
+echo "Done. In $dir:"
+for f in "${name}_bg.fit" "${name}_bg_preview.jpg" "${name}_linear.fit" "${name}_linear_preview.jpg" \
+         "${name}_dehalo.fit" "${name}_dehalo_preview.jpg" "${name}_starless.fit" "${name}_starmask.fit"; do
+  [[ -f "$dir/$f" ]] && echo "  $f"
+done
+echo
+echo "Check ${name}_bg_preview.jpg for dark holes around the target (gradient removal"
+echo "taking real signal) and ${name}_linear_preview.jpg for the color balance."
+if [[ $starnet -eq 1 ]]; then
+  echo "Then open ${name}_starless.fit in Siril to stretch; ${name}_starmask.fit waits for Star Recomposition."
+elif [[ $dehalo -eq 1 ]]; then
+  echo "Then open ${name}_dehalo.fit in Siril to stretch (the glow around the planet is removed)."
+else
+  echo "Then open ${name}_linear.fit in Siril to stretch."
+fi
