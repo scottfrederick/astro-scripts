@@ -169,7 +169,9 @@ mkdir -p "$dir/logs"
 # run_step STEP: run the Siril script on stdin for STEP; returns Siril's status
 run_step() {
   local step="$1" ssf="$dir/logs/linear-$1.ssf" log
-  { echo "requires 1.4.0"; echo "setext fit"; cat; } > "$ssf"
+  # set32bits: linear data must be saved as 32-bit float (Siril remembers the bit depth
+  # between runs, and astro-preprocess uses 16 bits for its intermediate frames)
+  { echo "requires 1.4.0"; echo "setext fit"; echo "set32bits"; cat; } > "$ssf"
   if [[ $dry_run -eq 1 ]]; then
     echo "---- $step"; cat "$ssf"; echo; return 0
   fi
@@ -305,7 +307,10 @@ if [[ $starnet -eq 1 ]] && should_run stars; then
     echo "isub ${name}_starless"
     echo "save ${name}_starmask"
   } | run_step stars || {
-    echo "   Is StarNet installed and its location set in Siril's preferences?" >&2
+    log="$(ls -t "$dir"/logs/linear-stars-*.log 2>/dev/null | head -n1)"
+    if [[ -n "$log" ]] && grep -qiE 'starnet.*(not found|fail|error|cannot|no such)|(not found|fail|error|cannot).*starnet' "$log"; then
+      echo "   Is StarNet installed and its location set in Siril's preferences?" >&2
+    fi
     exit 1
   }
   # StarNet also writes its own copy of the starless image; it duplicates _starless

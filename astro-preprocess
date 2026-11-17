@@ -508,6 +508,9 @@ ssf="$out/preprocess.ssf"
     fi
     register_and_stack "$seq" "$stackdir/result"
   fi
+  echo
+  echo "# Leave Siril saving 32-bit files (it remembers this between runs)"
+  echo "set32bits"
 } > "$ssf"
 echo "Wrote $ssf"
 
