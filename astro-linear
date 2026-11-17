@@ -169,7 +169,7 @@ mkdir -p "$dir/logs"
 # run_step STEP: run the Siril script on stdin for STEP; returns Siril's status
 run_step() {
   local step="$1" ssf="$dir/logs/linear-$1.ssf" log
-  { echo "requires 1.2.0"; echo "setext fit"; cat; } > "$ssf"
+  { echo "requires 1.4.0"; echo "setext fit"; cat; } > "$ssf"
   if [[ $dry_run -eq 1 ]]; then
     echo "---- $step"; cat "$ssf"; echo; return 0
   fi

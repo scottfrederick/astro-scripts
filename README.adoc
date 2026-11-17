@@ -33,7 +33,7 @@ Run any script with `+--help+` for its options, or see the <<_command_reference,
 
 * Linux with bash and the GNU coreutils
 * Python 3.10 or newer with `+numpy+` and `+astropy+`
-* Siril 1.2.4 or newer
+* Siril 1.4.0 or newer
 ** `+siril-cli+` on `+PATH+`, or the `+org.siril.Siril+` flatpak
 ** set `+SIRIL_CLI+` to override, e.g. `+SIRIL_CLI="siril-cli"+`
 * https://starnetastro.com[StarNet] for star removal in `+astro-linear+`
@@ -194,6 +194,16 @@ astro-preprocess ~/Astro/M33
 ----
 
 Calibrates, registers and stacks all nights -> `+~/Astro/M33-processed/result_<seconds>s.fit+`.
+Frames are weighted by background noise, so nights with a brighter sky count for less.
+
+When some of the nights were moonlit, add `+--seqsubsky+` to remove the gradient from each frame
+before registration. The Moon moves and a meridian flip turns the frame, so the gradient points a
+different way from frame to frame, and a single fit on the stack can't take it out cleanly.
+
+[source,sh]
+----
+astro-preprocess --seqsubsky ~/Astro/M33
+----
 
 ==== 2. Linear processing
 
@@ -439,6 +449,14 @@ Each session is calibrated with its own flats. All sessions are then merged into
 one sequence, registered and stacked together, so pixel rejection works across
 all nights. Originals are never written to: Siril reads them through the links.
 
+Frames are weighted by background noise when stacked, so subs shot under a
+brighter sky (moonlight, haze, low altitude) add their signal without diluting
+the cleaner ones. For sessions where the gradient changes during the night (a
+Moon moving across the sky, or a meridian flip turning the frame relative to
+it), --seqsubsky removes a first-degree gradient from every calibrated frame
+before registration, so the stack starts flatter than one big gradient fit
+afterwards could make it.
+
 SESSION limits the run to the named session folders (e.g. 2026-11-13).
 
 Short-exposure sets with no calibration frames (e.g. Saturn's moons shot as an
@@ -467,6 +485,11 @@ Options:
                        implies --separate
       --no-filter      keep every frame (default drops frames more than 3 sigma
                        worse than average in roundness or FWHM, i.e. trailed or soft)
+      --no-weight      weight every frame equally (default weights by background
+                       noise, so moonlit or hazy subs count for less)
+      --seqsubsky      remove a first-degree gradient from each calibrated frame
+                       before registration (moonlit nights, or a gradient that
+                       turns with a meridian flip); not with --planet
       --temp-tol N     warn when dark and light temperatures differ by more than
                        N degrees C (default 2)
       --clean          after a successful stack, delete process/ and stack/
@@ -475,6 +498,7 @@ Options:
 
 Examples:
   astro-preprocess ~/Astro/M33
+  astro-preprocess --seqsubsky ~/Astro/M33
   astro-preprocess --lights-only --planet ~/Astro/Saturn-moons
   astro-preprocess -p ~/Astro/M33 2026-11-13
   astro-preprocess -n ~/Astro/M33

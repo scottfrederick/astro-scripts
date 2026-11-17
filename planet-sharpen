@@ -125,7 +125,7 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="planet-sharpen-", dir=out_dir if not args.dry_run else None))
     reg = {"tv": " -tv", "fh": " -fh", "none": ""}[args.regularization]
     method = "" if args.gradient_descent else " -mul"
-    lines = ["requires 1.2.4", "setext fits", f'cd "{work}"',
+    lines = ["requires 1.4.0", "setext fits", f'cd "{work}"',
              f"makepsf manual -gaussian -fwhm={args.fwhm}"]
     print(f"Processing {len(inputs)} file(s) from {folder}")
     print(f"  crop {cw}x{ch}, FWHM {args.fwhm}, alpha {args.alpha:g}, {args.iters} iterations, "

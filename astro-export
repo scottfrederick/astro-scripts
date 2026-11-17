@@ -69,7 +69,7 @@ trap 'rm -rf "$work"' EXIT
 
 script="$work/export.ssf"
 {
-  echo "requires 1.2.0"
+  echo "requires 1.4.0"
   echo "cd \"$work\""
 } > "$script"
 
