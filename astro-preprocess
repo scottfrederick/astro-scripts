@@ -68,18 +68,26 @@
 #                        worse than average in roundness or FWHM, i.e. trailed or soft)
 #       --no-weight      weight every frame equally (default weights by background
 #                        noise, so moonlit or hazy subs count for less)
+#       --relaxed        register trailed frames too (relaxed star detection, shift/
+#                        rotation/scale fit) and write two stacks: result_<s>s.fit
+#                        from the round-star frames only, as usual, and
+#                        fullstack_<s>s.fit from every frame that could be aligned,
+#                        for the starless image (astro-linear uses both); not with
+#                        --planet
 #       --seqsubsky      remove a first-degree gradient from each calibrated frame
 #                        before registration (moonlit nights, or a gradient that
 #                        turns with a meridian flip); not with --planet
 #       --temp-tol N     warn when dark and light temperatures differ by more than
 #                        N degrees C (default 2)
-#       --clean          after a successful stack, delete process/ and stack/
+#       --clean          after a successful stack, delete process/, stack/ and
+#                        masters/ (masters are rebuilt on every run)
 #       --ignore-space   run even if the free disk space looks too small
 #   -h, --help           show this help
 #
 # Examples:
 #   astro-preprocess ~/Astro/M33
 #   astro-preprocess --seqsubsky ~/Astro/M33
+#   astro-preprocess --relaxed ~/Astro/M33
 #   astro-preprocess --lights-only --planet ~/Astro/Saturn-moons
 #   astro-preprocess -p ~/Astro/M33 2026-11-13
 #   astro-preprocess -n ~/Astro/M33
@@ -98,6 +106,7 @@ force=0
 filter=1
 weight=1
 seqsubsky=0
+relaxed=0
 lights_only=0
 separate=0
 planet=0
@@ -123,6 +132,7 @@ while [[ $# -gt 0 ]]; do
     --no-filter)       filter=0; shift ;;
     --no-weight)       weight=0; shift ;;
     --seqsubsky)       seqsubsky=1; shift ;;
+    --relaxed)         relaxed=1; shift ;;
     --lights-only)     lights_only=1; shift ;;
     --separate)        separate=1; shift ;;
     --planet)          planet=1; separate=1; shift ;;
@@ -136,6 +146,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $planet -eq 0 || $seqsubsky -eq 0 ]] || die "--seqsubsky can't be used with --planet (planet frames aren't star-registered)"
+[[ $planet -eq 0 || $relaxed -eq 0 ]] || die "--relaxed can't be used with --planet (planet frames aren't star-registered)"
 
 # A first argument that is a session folder name (or a session path) rather than a
 # target folder means "use the current folder as the target".
@@ -235,7 +246,7 @@ echo "Target:       $target"
 echo "Calibration:  $calib"
 echo "Output:       $out"
 echo "Sessions:     ${#sessions[@]}"
-echo "Stacking:     $( [[ $weight -eq 1 ]] && echo "weighted by background noise" || echo "equal weights" )$( [[ $seqsubsky -eq 1 ]] && echo ", per-frame gradient removal" || true )"
+echo "Stacking:     $( [[ $weight -eq 1 ]] && echo "weighted by background noise" || echo "equal weights" )$( [[ $seqsubsky -eq 1 ]] && echo ", per-frame gradient removal" || true )$( [[ $relaxed -eq 1 ]] && echo ", relaxed registration + full stack" || true )"
 echo
 
 # ---------------------------------------------------------------- plan each session
@@ -470,6 +481,15 @@ ssf="$out/preprocess.ssf"
   if [[ $lights_only -eq 1 ]]; then pseq="pp_cc_light"; else pseq="pp_light"; fi
   reg_opts="-2pass"
   apply_opts=""; [[ $filter -eq 0 ]] || apply_opts=" -filter-round=3k -filter-wfwhm=3k"
+  # --relaxed: keep star detection from rejecting trailed stars, and fit only shift,
+  # rotation and scale, which all frames from one telescope need and which tolerates
+  # elongated stars far better than the default homography. Every aligned frame is
+  # kept; the round-star filter moves to the strict stack instead.
+  if [[ $relaxed -eq 1 ]]; then
+    reg_opts="-2pass -transf=similarity"
+    filter_opts="${apply_opts# }"
+    apply_opts=""
+  fi
   stack_opts="-norm=addscale -output_norm -rgb_equal"
   [[ $weight -eq 0 ]] || stack_opts+=" -weight=noise"
   register_and_stack() { # register_and_stack SEQ OUTPUT
@@ -478,10 +498,18 @@ ssf="$out/preprocess.ssf"
       echo "seqsubsky $seq 1"
       seq="bkg_$seq"
     fi
+    [[ $relaxed -eq 0 ]] || echo "setfindstar -relax=on -roundness=0.3"
     echo "register $seq $reg_opts"
+    # Siril remembers star detection settings between runs: restore the defaults
+    [[ $relaxed -eq 0 ]] || echo "setfindstar reset"
     echo "seqapplyreg $seq$apply_opts"
     echo "set32bits"
-    echo "stack r_$seq rej 3 3 $stack_opts -out=$2"
+    if [[ $relaxed -eq 1 ]]; then
+      echo "stack r_$seq rej 3 3 $stack_opts -out=${2}_full"
+      echo "stack r_$seq rej 3 3 $stack_opts${filter_opts:+ $filter_opts} -out=$2"
+    else
+      echo "stack r_$seq rej 3 3 $stack_opts -out=$2"
+    fi
     echo "set16bits"
   }
   echo
@@ -598,20 +626,34 @@ finish_stack() {
   echo "Stack: $final"
 }
 
+# stack_count FILE: number of frames in a stack
+stack_count() { local c; c="$(fits_key "$1" STACKCNT)"; echo "${c:-?}"; }
+
 echo
 if [[ $separate -eq 1 ]]; then
   for i in "${!sessions[@]}"; do
+    if [[ $relaxed -eq 1 ]]; then
+      echo "Frames: $(stack_count "$stackdir/result_${s_name[$i]}_full.fit") aligned (full stack), $(stack_count "$stackdir/result_${s_name[$i]}.fit") with round stars"
+      finish_stack "$stackdir/result_${s_name[$i]}_full.fit" "fullstack_${s_name[$i]}_" "${s_exptime[$i]}"
+    fi
     finish_stack "$stackdir/result_${s_name[$i]}.fit" "result_${s_name[$i]}_" "${s_exptime[$i]}"
   done
 else
+  if [[ $relaxed -eq 1 ]]; then
+    echo "Frames: $total_lights calibrated, $(stack_count "$stackdir/result_full.fit") aligned (full stack), $(stack_count "$stackdir/result.fit") with round stars (strict stack)"
+    if [[ "$(stack_count "$stackdir/result_full.fit")" == "$(stack_count "$stackdir/result.fit")" && $filter -eq 1 ]]; then
+      warn "both stacks contain the same frames: the round-star filter had no effect on the strict stack"
+    fi
+    finish_stack "$stackdir/result_full.fit" "fullstack_" "$ref_exptime"
+  fi
   finish_stack "$stackdir/result.fit" "result_" "$ref_exptime"
 fi
 
 if [[ $clean -eq 1 ]]; then
   for i in "${!sessions[@]}"; do rm -rf "$out/${s_name[$i]}/process" "$out/${s_name[$i]}/aligned"; done
-  rm -rf "$stackdir" "$masters/process"
-  echo "Removed intermediate frames (process/ and stack/)."
+  rm -rf "$stackdir" "$masters"
+  echo "Removed intermediate files (process/, stack/ and masters/)."
 else
-  echo "Intermediate frames kept in */process and stack/ ($(du -sh "$out" 2>/dev/null | cut -f1) total); rerun with --clean or delete them when done."
+  echo "Intermediate files kept in */process, stack/ and masters/ ($(du -sh "$out" 2>/dev/null | cut -f1) total); rerun with --clean or delete them when done."
 fi
 [[ $warnings -eq 0 ]] || echo "Warnings: $warnings (see above)"

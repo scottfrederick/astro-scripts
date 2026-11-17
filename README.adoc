@@ -487,6 +487,12 @@ Options:
                        worse than average in roundness or FWHM, i.e. trailed or soft)
       --no-weight      weight every frame equally (default weights by background
                        noise, so moonlit or hazy subs count for less)
+      --relaxed        register trailed frames too (relaxed star detection, shift/
+                       rotation/scale fit) and write two stacks: result_<s>s.fit
+                       from the round-star frames only, as usual, and
+                       fullstack_<s>s.fit from every frame that could be aligned,
+                       for the starless image (astro-linear uses both); not with
+                       --planet
       --seqsubsky      remove a first-degree gradient from each calibrated frame
                        before registration (moonlit nights, or a gradient that
                        turns with a meridian flip); not with --planet
@@ -499,6 +505,7 @@ Options:
 Examples:
   astro-preprocess ~/Astro/M33
   astro-preprocess --seqsubsky ~/Astro/M33
+  astro-preprocess --relaxed ~/Astro/M33
   astro-preprocess --lights-only --planet ~/Astro/Saturn-moons
   astro-preprocess -p ~/Astro/M33 2026-11-13
   astro-preprocess -n ~/Astro/M33
@@ -527,6 +534,13 @@ stack file is given. Then it runs the linear steps:
   5. stars     StarNet: starless image plus a stars-only image for Star
                Recomposition                                   -> <name>_starless.fit
                                                                   <name>_starmask.fit
+
+With a full stack from astro-preprocess --relaxed (fullstack_<seconds>s.fit, made in
+the same run as the result_ stack), steps 1-4 run on both stacks. In step 5 the
+starless image is taken from the full stack (every aligned frame: the most signal
+for the faint parts) and the stars from the strict stack (round-star frames only):
+<name>_starless.fit and <name>_starmask.fit, ready for Star Recomposition as usual.
+The full stack's own files are named <name>_full_*.
 
 Every file is still linear. Autostretched JPEG previews are written next to them
 (<name>_bg_preview.jpg, <name>_linear_preview.jpg) so you can check the gradient
@@ -565,6 +579,7 @@ Options:
                         image (planet-dehalo, next to this script) -> <name>_dehalo.fit
                         and <name>_dehalo_preview.jpg; for moon shots
       --no-starnet      stop after the linear image
+      --no-full         ignore a full stack from astro-preprocess --relaxed
       --from STEP       start at crop, bg, solve, color or stars (default crop)
   -n, --dry-run         print the Siril scripts, run nothing
   -h, --help            show this help

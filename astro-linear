@@ -18,6 +18,13 @@
 #                Recomposition                                   -> <name>_starless.fit
 #                                                                   <name>_starmask.fit
 #
+# With a full stack from astro-preprocess --relaxed (fullstack_<seconds>s.fit, made in
+# the same run as the result_ stack), steps 1-4 run on both stacks. In step 5 the
+# starless image is taken from the full stack (every aligned frame: the most signal
+# for the faint parts) and the stars from the strict stack (round-star frames only):
+# <name>_starless.fit and <name>_starmask.fit, ready for Star Recomposition as usual.
+# The full stack's own files are named <name>_full_*.
+#
 # Every file is still linear. Autostretched JPEG previews are written next to them
 # (<name>_bg_preview.jpg, <name>_linear_preview.jpg) so you can check the gradient
 # removal and the color balance without opening Siril. The previews use a linked
@@ -55,6 +62,7 @@
 #                         image (planet-dehalo, next to this script) -> <name>_dehalo.fit
 #                         and <name>_dehalo_preview.jpg; for moon shots
 #       --no-starnet      stop after the linear image
+#       --no-full         ignore a full stack from astro-preprocess --relaxed
 #       --from STEP       start at crop, bg, solve, color or stars (default crop)
 #   -n, --dry-run         print the Siril scripts, run nothing
 #   -h, --help            show this help
@@ -78,6 +86,7 @@ filter="Optolong L-Pro"
 use_pcc=0
 no_color=0
 dehalo=0
+use_full=1
 rmgreen=0
 denoise=""
 starnet=1
@@ -99,6 +108,7 @@ while [[ $# -gt 0 ]]; do
     --pcc)         use_pcc=1; shift ;;
     --no-color)    no_color=1; shift ;;
     --dehalo)      dehalo=1; shift ;;
+    --no-full)     use_full=0; shift ;;
     --rmgreen)     rmgreen=1; shift ;;
     --denoise)     if [[ "${2:-}" =~ ^[0-9.]+$ ]]; then denoise="$2"; shift 2; else denoise="0.6"; shift; fi ;;
     --no-starnet)  starnet=0; shift ;;
@@ -148,7 +158,25 @@ fits_key() {
     | sed -E "s/^[^=]*= *//; s| */.*$||; s/'//g; s/ *$//" || true
 }
 
+# A full stack (astro-preprocess --relaxed) for the same session, written in the same run
+full=""
+if [[ $use_full -eq 1 ]]; then
+  key=""
+  [[ "$(basename "$stack" .fit)" =~ ^result_(.+)_[0-9]+s$ ]] && key="${BASH_REMATCH[1]}_"
+  for f in "$dir"/fullstack_*.fit; do
+    [[ -f "$f" ]] || continue
+    b="$(basename "$f" .fit)"
+    if [[ -n "$key" ]]; then [[ "$b" =~ ^fullstack_${key}[0-9]+s$ ]] || continue
+    else [[ "$b" =~ ^fullstack_[0-9]+s$ ]] || continue; fi
+    # made in the same run: within an hour of the strict stack
+    dt=$(( $(stat -c %Y "$f") - $(stat -c %Y "$stack") )); dt=${dt#-}
+    [[ $dt -le 3600 ]] || continue
+    if [[ -z "$full" || "$f" -nt "$full" ]]; then full="$f"; fi
+  done
+fi
+
 echo "Stack:   $stack"
+[[ -z "$full" ]] || echo "Full:    $full (starless image from here, stars from the stack above)"
 echo "Outputs: $dir/${name}_*.fit"
 echo
 
@@ -197,6 +225,8 @@ should_run() { # should_run STEP: true if STEP is at or after --from
   return 1
 }
 
+# Steps 1-4 for one stack: uses $stack, $name and $sfx (step-name suffix for the logs)
+linear_steps() {
 # ---------------------------------------------------------------- 1-2. crop and gradient
 
 # crop and bg are one Siril call; --from bg reuses an existing _crop file.
@@ -227,7 +257,7 @@ if should_run crop || should_run bg; then
     echo "save ${name}_bg"
     echo "autostretch -linked"
     echo "savejpg ${name}_bg_preview 90"
-  } | run_step bg || { rm -f "$dir/${name}_input.fit"; exit 1; }
+  } | run_step "bg$sfx" || { rm -f "$dir/${name}_input.fit"; exit 1; }
   rm -f "$dir/${name}_input.fit"
 fi
 
@@ -235,7 +265,7 @@ fi
 
 if should_run solve && [[ $no_color -eq 0 ]]; then
   need "${name}_bg"
-  printf 'load %s\nplatesolve\nsave %s\n' "${name}_bg" "${name}_bg" | run_step solve || {
+  printf 'load %s\nplatesolve\nsave %s\n' "${name}_bg" "${name}_bg" | run_step "solve$sfx" || {
     echo "   Check that FOCALLEN in the header is right (952 native, 666 with the reducer)," >&2
     echo "   and that Siril can reach its star catalogs." >&2
     exit 1
@@ -259,19 +289,30 @@ if should_run color; then
   spcc_cmd="spcc \"-oscsensor=$sensor\""
   [[ "${filter,,}" == none ]] || spcc_cmd+=" \"-oscfilter=$filter\""
   if [[ $no_color -eq 1 ]]; then
-    color_script "" | run_step color || exit 1
+    color_script "" | run_step "color$sfx" || exit 1
     [[ $dry_run -eq 1 ]] || echo "   color calibration: skipped (--no-color)"
   elif [[ $use_pcc -eq 1 ]]; then
-    color_script "pcc" | run_step color || exit 1
+    color_script "pcc" | run_step "color$sfx" || exit 1
     [[ $dry_run -eq 1 ]] || echo "   color calibration: PCC"
-  elif color_script "$spcc_cmd" | run_step color; then
+  elif color_script "$spcc_cmd" | run_step "color$sfx"; then
     [[ $dry_run -eq 1 ]] || echo "   color calibration: SPCC ($sensor, filter: $filter)"
   else
     echo "   SPCC failed (often a sensor or filter name that doesn't match Siril's list exactly)." >&2
     echo "   Falling back to PCC." >&2
-    color_script "pcc" | run_step color-pcc || exit 1
+    color_script "pcc" | run_step "color-pcc$sfx" || exit 1
     [[ $dry_run -eq 1 ]] || echo "   color calibration: PCC (fallback)"
   fi
+fi
+
+}
+
+sfx=""; linear_steps
+if [[ -n "$full" ]]; then
+  strict_stack="$stack"; strict_name="$name"
+  stack="$full"; name="${strict_name}_full"; sfx="-full"
+  echo "-- full stack"
+  linear_steps
+  stack="$strict_stack"; name="$strict_name"; sfx=""
 fi
 
 # ---------------------------------------------------------------- 4b. dehalo
@@ -298,14 +339,29 @@ fi
 
 if [[ $starnet -eq 1 ]] && should_run stars; then
   need "${name}_linear"
+  [[ -z "$full" ]] || need "${name}_full_linear"
   {
-    echo "load ${name}_linear"
-    echo "starnet -stretch -nostarmask"
-    echo "save ${name}_starless"
-    # stars only = linear image minus starless, what Star Recomposition wants
-    echo "load ${name}_linear"
-    echo "isub ${name}_starless"
-    echo "save ${name}_starmask"
+    if [[ -z "$full" ]]; then
+      echo "load ${name}_linear"
+      echo "starnet -stretch -nostarmask"
+      echo "save ${name}_starless"
+      # stars only = linear image minus starless, what Star Recomposition wants
+      echo "load ${name}_linear"
+      echo "isub ${name}_starless"
+      echo "save ${name}_starmask"
+    else
+      # stars from the strict stack (round stars only)
+      echo "load ${name}_linear"
+      echo "starnet -stretch -nostarmask"
+      echo "save ${name}_strict_starless"
+      echo "load ${name}_linear"
+      echo "isub ${name}_strict_starless"
+      echo "save ${name}_starmask"
+      # starless image from the full stack (every aligned frame)
+      echo "load ${name}_full_linear"
+      echo "starnet -stretch -nostarmask"
+      echo "save ${name}_starless"
+    fi
   } | run_step stars || {
     log="$(ls -t "$dir"/logs/linear-stars-*.log 2>/dev/null | head -n1)"
     if [[ -n "$log" ]] && grep -qiE 'starnet.*(not found|fail|error|cannot|no such)|(not found|fail|error|cannot).*starnet' "$log"; then
@@ -314,7 +370,8 @@ if [[ $starnet -eq 1 ]] && should_run stars; then
     exit 1
   }
   # StarNet also writes its own copy of the starless image; it duplicates _starless
-  [[ $dry_run -eq 1 ]] || rm -f "$dir/starless_${name}_linear.fit"
+  [[ $dry_run -eq 1 ]] || rm -f "$dir/starless_${name}_linear.fit" "$dir/starless_${name}_full_linear.fit" \
+    "$dir/${name}_strict_starless.fit"
 fi
 
 [[ $dry_run -eq 1 ]] && exit 0
@@ -324,7 +381,9 @@ fi
 echo
 echo "Done. In $dir:"
 for f in "${name}_bg.fit" "${name}_bg_preview.jpg" "${name}_linear.fit" "${name}_linear_preview.jpg" \
-         "${name}_dehalo.fit" "${name}_dehalo_preview.jpg" "${name}_starless.fit" "${name}_starmask.fit"; do
+         "${name}_dehalo.fit" "${name}_dehalo_preview.jpg" \
+         "${name}_full_bg_preview.jpg" "${name}_full_linear.fit" "${name}_full_linear_preview.jpg" \
+         "${name}_starless.fit" "${name}_starmask.fit"; do
   [[ -f "$dir/$f" ]] && echo "  $f"
 done
 echo
