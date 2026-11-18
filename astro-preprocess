@@ -4,20 +4,25 @@
 #
 #   astro-preprocess [options] [DIR] [SESSION ...]
 #
-# DIR can be the source target folder or its -processed folder, and defaults to
-# the current folder, so the script can be run from either place:
-#   ~/Astro/M33             source: session folders containing Light and Flat
-#   ~/Astro/M33-processed   output: the source is the same path without -processed
+# Raw data follows target/filter/session, where filter is none, broadband, narrowband
+# or dualband, and each session folder uses the ASIAIR layout:
+#   ~/Astro/IC1805/broadband/2026-11-17/Light/*.fit
+#   ~/Astro/IC1805/broadband/2026-11-17/Flat/*.fit
+#   ~/Astro/IC1805/dualband/2026-11-20/Light/*.fit
+#   ~/Astro/M33/none/2026-11-07/Light/*.fit
+# Each filter folder is stacked on its own, with each session's own flats, into
+# <target>-processed/<filter> (e.g. ~/Astro/IC1805-processed/broadband).
 #
-# The source folder uses the ASIAIR layout, one folder per session:
-#   ~/Astro/M33/2026-11-07/Light/*.fit
-#   ~/Astro/M33/2026-11-07/Flat/*.fit
+# DIR is a target (every filter folder in it, one stack each), a filter folder (that
+# one only), or either one's -processed counterpart, and defaults to the current
+# folder, so the script can be run from any of those places.
+#
 # Darks and biases come from the calibration library (default ~/Astro/Calibration),
 # matched on exposure, gain, offset and binning read from the FITS headers. Darks
 # are picked per session, closest in sensor temperature to that session's lights,
 # so nights shot at different cooler setpoints each get their own matching darks.
 #
-# Output goes to <target>-processed next to the source (e.g. ~/Astro/M33-processed):
+# Output goes to <target>-processed/<filter> (e.g. ~/Astro/IC1805-processed/broadband):
 #   <session>/lights, flats, darks, biases   symlinks to the originals, laid out like
 #                                            Siril's OSC_Preprocessing working directory
 #   <session>/process                        that session's calibrated frames
@@ -40,6 +45,13 @@
 #
 # SESSION limits the run to the named session folders (e.g. 2026-11-13).
 #
+# The dualband folder holds dual-band data (Ha + OIII, e.g. Optolong L-eXtreme): lights
+# are calibrated without debayering, each frame is split into Ha (red pixels) and OIII
+# (green and blue pixels) with Siril's seqextract_HaOIII, Ha upsampled to full size,
+# and the two are stacked separately -> result_Ha_<seconds>s.fit and
+# result_OIII_<seconds>s.fit. astro-hoo combines them. The other folders, narrowband
+# included, are stacked as ordinary color.
+#
 # Short-exposure sets with no calibration frames (e.g. Saturn's moons shot as an
 # Autorun) use --lights-only: sessions need only a Light folder; hot pixels are
 # removed by cosmetic correction instead of darks. Add --separate to stack each
@@ -53,7 +65,7 @@
 #
 # Options:
 #   -c, --calib DIR      calibration library (default ~/Astro/Calibration)
-#   -o, --out-dir DIR    output folder (default <target>-processed)
+#   -o, --out-dir DIR    output folder (default <target>-processed/<filter>)
 #       --copy           copy frames instead of symlinking them
 #   -p, --prepare-only   build the folders and preprocess.ssf, don't run Siril
 #   -n, --dry-run        show what would be linked and matched, change nothing
@@ -85,14 +97,15 @@
 #   -h, --help           show this help
 #
 # Examples:
-#   astro-preprocess ~/Astro/M33
-#   astro-preprocess --seqsubsky ~/Astro/M33
+#   astro-preprocess ~/Astro/IC1805                (each filter folder, stacked separately)
+#   astro-preprocess --seqsubsky ~/Astro/M33/none
 #   astro-preprocess --relaxed ~/Astro/M33
-#   astro-preprocess --lights-only --planet ~/Astro/Saturn-moons
-#   astro-preprocess -p ~/Astro/M33 2026-11-13
+#   astro-preprocess ~/Astro/IC1805/dualband 2026-11-20   (Ha and OIII stacks)
+#   astro-preprocess --lights-only --planet ~/Astro/Saturn-moons/none
+#   astro-preprocess -p ~/Astro/M33/none 2026-11-13
 #   astro-preprocess -n ~/Astro/M33
-#   cd ~/Astro/M33 && astro-preprocess 2026-11-13
-#   cd ~/Astro/M33-processed && astro-preprocess -f
+#   cd ~/Astro/M33/none && astro-preprocess 2026-11-13
+#   cd ~/Astro/M33-processed/none && astro-preprocess -f
 
 set -euo pipefail
 shopt -s nullglob
@@ -109,12 +122,14 @@ seqsubsky=0
 relaxed=0
 lights_only=0
 separate=0
+narrowband=0   # Ha/OIII split, set for the dualband folder
 planet=0
 temp_tol=2
 clean=0
 ignore_space=0
 target=""
 sessions_wanted=()
+passthru=()   # options to hand on when a multi-filter target runs once per filter
 
 usage() { sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; }
 die()   { echo "error: $*" >&2; exit 1; }
@@ -122,6 +137,12 @@ warn()  { echo "  WARNING: $*" >&2; warnings=$((warnings + 1)); }
 warnings=0
 
 while [[ $# -gt 0 ]]; do
+  # options that apply per filter are remembered for a multi-filter target
+  case "$1" in
+    -c|--calib|--temp-tol)        passthru+=("$1" "$2") ;;
+    -o|--out-dir|--out|-h|--help) ;;
+    -*)                           passthru+=("$1") ;;
+  esac
   case "$1" in
     -c|--calib)        calib="$2"; shift 2 ;;
     -o|--out-dir|--out) out="$2"; shift 2 ;;
@@ -158,20 +179,67 @@ target="${target:-.}"
 [[ -d "$target" ]] || die "folder not found: $target"
 target="$(cd "$target" && pwd)"
 
-# Run from the -processed folder: the source is the same path without the suffix.
+filter_names="none broadband narrowband dualband"
+is_filter_name() { [[ " $filter_names " == *" $1 "* ]]; }
+
+# has_sessions DIR: DIR holds at least one session folder (a folder with a Light folder)
+has_sessions() { local d; for d in "$1"/*/; do [[ -d "$d/Light" ]] && return 0; done; return 1; }
+
+# Run from a -processed folder: the source is the same path without the suffix,
+# for the target itself or for a filter folder in it.
 if [[ "$target" == *-processed ]]; then
   out="${out:-$target}"
   target="${target%-processed}"
   [[ -d "$target" ]] || die "source folder for $out not found: $target"
+elif is_filter_name "$(basename "$target")" && [[ "$(dirname "$target")" == *-processed ]]; then
+  out="${out:-$target}"
+  p="$(dirname "$target")"; target="${p%-processed}/$(basename "$target")"
+  [[ -d "$target" ]] || die "source folder for $out not found: $target"
 fi
-src_ok=0; for d in "$target"/*/; do [[ -d "$d/Light" ]] && { src_ok=1; break; }; done
-[[ $src_ok -eq 1 ]] || die "$target isn't a target folder (no session folders with a Light folder) or a -processed folder"
+
+# A target: stack each of its filter folders on its own, one run per folder.
+if ! is_filter_name "$(basename "$target")"; then
+  filters=()
+  for f in $filter_names; do [[ -d "$target/$f" ]] && has_sessions "$target/$f" && filters+=("$f"); done
+  [[ ${#filters[@]} -gt 0 ]] || die "$target has no none, broadband, narrowband or dualband folder with session folders in it (expected $target/<filter>/<session>/Light)"
+  echo "Filters:      ${filters[*]} (each stacked separately)"
+  failed=()
+  for f in "${filters[@]}"; do
+    echo
+    echo "======== $(basename "$target") / $f"
+    fout=(); [[ -z "$out" ]] || fout=(-o "$out/$f")
+    [[ -z "$out" ]] || mkdir -p "$out"
+    bash "$0" "${passthru[@]}" "${fout[@]}" "$target/$f" "${sessions_wanted[@]}" || failed+=("$f")
+  done
+  echo
+  [[ ${#failed[@]} -eq 0 ]] || die "failed for: ${failed[*]}"
+  echo "All filters done: ${filters[*]}"
+  exit 0
+fi
+
+# A filter folder writes to <target>-processed/<filter>; the dualband folder is
+# stacked as Ha and OIII.
+if [[ -z "$out" ]]; then
+  out="$(dirname "$target")-processed/$(basename "$target")"
+  [[ $dry_run -eq 1 ]] || mkdir -p "$(dirname "$out")"
+fi
+if [[ "$(basename "$target")" == dualband ]]; then
+  [[ $lights_only -eq 0 && $separate -eq 0 && $relaxed -eq 0 ]] \
+    || die "the dualband folder is stacked as Ha and OIII, which can't be combined with --lights-only, --separate, --planet or --relaxed"
+  narrowband=1
+fi
+
+has_sessions "$target" || die "no session folders (with a Light folder) in $target"
 [[ $lights_only -eq 1 || -d "$calib" ]] || die "calibration folder not found: $calib"
 target="$(cd "$target" && pwd)"
 [[ ! -d "$calib" ]] || calib="$(cd "$calib" && pwd)"
 out="${out:-$target-processed}"
-[[ -d "$(dirname "$out")" ]] || die "parent of the output folder doesn't exist: $(dirname "$out")"
-out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+if [[ -d "$(dirname "$out")" ]]; then
+  out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
+elif [[ $dry_run -eq 0 || "$out" != /* ]]; then
+  # (a dry run of a filter folder may not have created <target>-processed yet)
+  die "parent of the output folder doesn't exist: $(dirname "$out")"
+fi
 
 # Siril scripts break on spaces in paths; the frames themselves are linked under
 # simple names, but the output folder has to be space-free too.
@@ -246,6 +314,7 @@ echo "Target:       $target"
 echo "Calibration:  $calib"
 echo "Output:       $out"
 echo "Sessions:     ${#sessions[@]}"
+[[ $narrowband -eq 0 ]] || echo "Dualband:     Ha and OIII stacked separately"
 echo "Stacking:     $( [[ $weight -eq 1 ]] && echo "weighted by background noise" || echo "equal weights" )$( [[ $seqsubsky -eq 1 ]] && echo ", per-frame gradient removal" || true )$( [[ $relaxed -eq 1 ]] && echo ", relaxed registration + full stack" || true )"
 echo
 
@@ -358,7 +427,7 @@ fi
 copies=2; [[ $seqsubsky -eq 0 ]] || copies=3
 est_bytes=$(( total_lights * ref_w * ref_h * 6 * copies ))
 est_gb=$(( est_bytes / 1024 / 1024 / 1024 + 1 ))
-df_dir="$out"; [[ -d "$df_dir" ]] || df_dir="$(dirname "$out")"
+df_dir="$out"; while [[ ! -d "$df_dir" ]]; do df_dir="$(dirname "$df_dir")"; done
 avail_kb="$(df -Pk "$df_dir" 2>/dev/null | awk 'NR==2 { print $4 }')"
 avail_gb=$(( ${avail_kb:-0} / 1024 / 1024 ))
 echo "Disk:    about ${est_gb} GB needed for $total_lights lights, ${avail_gb} GB free on $(df -P "$df_dir" | awk 'NR==2 { print $6 }')"
@@ -465,7 +534,11 @@ ssf="$out/preprocess.ssf"
       echo "seqfind_cosme_cfa light 3 3"
       echo "calibrate cc_light -debayer -prefix=pp_"
     else
-      echo "# Session ${s_name[$i]}: master flat, then calibrate and debayer the lights"
+      if [[ $narrowband -eq 1 ]]; then
+        echo "# Session ${s_name[$i]}: master flat, then calibrate the lights (kept as CFA) and split them into Ha and OIII"
+      else
+        echo "# Session ${s_name[$i]}: master flat, then calibrate and debayer the lights"
+      fi
       echo "cd $sd/flats"
       echo "convert flat -out=$sd/process"
       echo "cd $sd/process"
@@ -474,7 +547,14 @@ ssf="$out/preprocess.ssf"
       echo "cd $sd/lights"
       echo "convert light -out=$sd/process"
       echo "cd $sd/process"
-      echo "calibrate light -dark=$masters/${dark_key[${s_dark[$i]}]} -flat=$masters/pflat_${s_name[$i]} -cc=dark -cfa -equalize_cfa -debayer"
+      if [[ $narrowband -eq 1 ]]; then
+        echo "calibrate light -dark=$masters/${dark_key[${s_dark[$i]}]} -flat=$masters/pflat_${s_name[$i]} -cc=dark -cfa -equalize_cfa"
+        # Ha from the red pixels is upsampled to the full frame size, OIII from the green
+        # and blue pixels already is: Ha_pp_light and OIII_pp_light
+        echo "seqextract_HaOIII pp_light -resample=ha"
+      else
+        echo "calibrate light -dark=$masters/${dark_key[${s_dark[$i]}]} -flat=$masters/pflat_${s_name[$i]} -cc=dark -cfa -equalize_cfa -debayer"
+      fi
     fi
   done
   # calibrated sequence name in each session's process folder
@@ -490,7 +570,8 @@ ssf="$out/preprocess.ssf"
     filter_opts="${apply_opts# }"
     apply_opts=""
   fi
-  stack_opts="-norm=addscale -output_norm -rgb_equal"
+  stack_opts="-norm=addscale -output_norm"
+  [[ $narrowband -eq 1 ]] || stack_opts+=" -rgb_equal"
   [[ $weight -eq 0 ]] || stack_opts+=" -weight=noise"
   register_and_stack() { # register_and_stack SEQ OUTPUT
     local seq="$1"
@@ -520,6 +601,22 @@ ssf="$out/preprocess.ssf"
       echo "# Register and stack session ${s_name[$i]} on its own"
       echo "cd $out/${s_name[$i]}/process"
       register_and_stack "$pseq" "$stackdir/result_${s_name[$i]}"
+      echo
+    done
+  elif [[ $narrowband -eq 1 ]]; then
+    for band in Ha OIII; do
+      echo "# Register and stack $band from all sessions together"
+      echo "cd $stackdir"
+      if [[ ${#sessions[@]} -gt 1 ]]; then
+        merge_args=""
+        for i in "${!sessions[@]}"; do merge_args+=" $out/${s_name[$i]}/process/${band}_$pseq"; done
+        echo "merge$merge_args $band"
+        seq="$band"
+      else
+        echo "cd $out/${s_name[0]}/process"
+        seq="${band}_$pseq"
+      fi
+      register_and_stack "$seq" "$stackdir/result_$band"
       echo
     done
   else
@@ -638,6 +735,11 @@ if [[ $separate -eq 1 ]]; then
     fi
     finish_stack "$stackdir/result_${s_name[$i]}.fit" "result_${s_name[$i]}_" "${s_exptime[$i]}"
   done
+elif [[ $narrowband -eq 1 ]]; then
+  echo "Frames: $total_lights calibrated, $(stack_count "$stackdir/result_Ha.fit") stacked in Ha, $(stack_count "$stackdir/result_OIII.fit") in OIII"
+  finish_stack "$stackdir/result_Ha.fit" "result_Ha_" "$ref_exptime"
+  finish_stack "$stackdir/result_OIII.fit" "result_OIII_" "$ref_exptime"
+  echo "Next: astro-hoo $(dirname "$out" | sed "s|^$HOME|~|")  (combines Ha and OIII, aligned to the broadband stack)"
 else
   if [[ $relaxed -eq 1 ]]; then
     echo "Frames: $total_lights calibrated, $(stack_count "$stackdir/result_full.fit") aligned (full stack), $(stack_count "$stackdir/result.fit") with round stars (strict stack)"

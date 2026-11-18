@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+#
+# astro-hoo: combine dual-band Ha and OIII stacks into a linear HOO image with Siril,
+# aligned to the target's broadband stack so its stars can go back in.
+#
+#   astro-hoo [options] [DIR]
+#
+# DIR is a target with filter folders (see astro-preprocess), its -processed folder,
+# or one of its filter folders, and defaults to the current folder:
+#   ~/Astro/IC1805-processed/dualband/result_Ha_<s>s.fit       Ha and OIII stacks
+#   ~/Astro/IC1805-processed/dualband/result_OIII_<s>s.fit
+#   ~/Astro/IC1805-processed/broadband/result_<s>s.fit         the stars
+#
+# Ha and OIII are registered onto the star stack's green channel, so the HOO image
+# has the star stack's exact frame: after astro-linear has run on both with the
+# same crop, the HOO starless image and the star stack's star mask line up for Star
+# Recomposition. OIII is then linearly matched to Ha (unless --no-match), so its much
+# fainter signal isn't lost in the stretch, and the channels are composed as
+# R = Ha, G = OIII, B = OIII.
+#
+# Output goes to <target>-processed/HOO:
+#   result_<seconds>s.fit   linear HOO, named after the Ha stack's total exposure
+#   Ha.fit, OIII.fit        the aligned linear channels (OIII before matching)
+# Next:
+#   astro-linear ~/Astro/IC1805-processed/broadband   stars: IC1805_broadband_starmask.fit
+#   astro-linear ~/Astro/IC1805-processed/HOO         IC1805_HOO_starless.fit
+#
+# The stars come from the broadband stack, or from the none stack (no filter) when
+# there's no broadband one. With neither (or with --no-stars), OIII is aligned to Ha
+# instead, and the HOO keeps its own stars.
+#
+# Siril is run headless via siril-cli; the org.siril.Siril flatpak is used if
+# siril-cli is not on PATH. Set SIRIL_CLI to override, e.g. SIRIL_CLI="siril-cli".
+#
+# Options:
+#       --stars NAME   the folder to take the stars from: broadband or none
+#                      (default: broadband if it has a stack, else none)
+#       --no-stars     don't use a broadband stack; align OIII to Ha
+#       --no-match     compose OIII as stacked, without matching it to Ha
+#       --keep         keep the work folder (HOO/work)
+#   -n, --dry-run      show what would be combined and print the Siril scripts
+#   -h, --help         show this help
+#
+# Examples:
+#   astro-hoo ~/Astro/IC1805
+#   cd ~/Astro/IC1805-processed && astro-hoo
+#   astro-hoo --stars none ~/Astro/IC1805-processed
+
+set -euo pipefail
+shopt -s nullglob
+
+nb_name="dualband"
+bb_name=""
+no_stars=0
+match=1
+keep=0
+dry_run=0
+input=""
+
+usage() { sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; }
+die()   { echo "error: $*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --stars)       bb_name="$2"; shift 2 ;;
+    --no-stars)    no_stars=1; shift ;;
+    --no-match)    match=0; shift ;;
+    --keep)        keep=1; shift ;;
+    -n|--dry-run)  dry_run=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    -*)            echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *)             input="$1"; shift ;;
+  esac
+done
+[[ $no_stars -eq 0 || -z "$bb_name" ]] || die "--stars and --no-stars can't be used together"
+[[ -z "$bb_name" || "$bb_name" == broadband || "$bb_name" == none ]] || die "--stars must be broadband or none"
+
+input="${input:-.}"
+[[ -d "$input" ]] || die "folder not found: $input"
+dir="$(cd "$input" && pwd)"
+
+# ---------------------------------------------------------------- find the stacks
+
+# The target's -processed folder, from any of the places this can be run from.
+parent="$(dirname "$dir")"
+if [[ "$dir" == *-processed ]]; then
+  proc="$dir"
+elif [[ "$parent" == *-processed ]]; then
+  proc="$parent"                                   # a filter folder (or HOO) in it
+else
+  case "$(basename "$dir")" in
+    none|broadband|narrowband|dualband) proc="$parent-processed" ;;   # a filter folder's source
+    *)                                  proc="$dir-processed" ;;      # the target's source folder
+  esac
+fi
+[[ -d "$proc" ]] || die "$proc not found (run astro-preprocess first)"
+[[ "$proc" != *" "* ]] || die "path contains a space, which Siril scripts can't handle: $proc"
+target="$(basename "${proc%-processed}")"
+
+newest() { local f; f="$(ls -t "$@" 2>/dev/null | head -n1)"; echo "$f"; }
+
+nbdir="$proc/$nb_name"
+[[ -d "$nbdir" ]] || die "$nbdir not found (run astro-preprocess on the target's dualband folder first)"
+ha="$(newest "$nbdir"/result_Ha_*.fit)"
+oiii="$(newest "$nbdir"/result_OIII_*.fit)"
+[[ -n "$ha" ]] || die "no result_Ha_*.fit in $nbdir (run astro-preprocess on the target's dualband folder)"
+[[ -n "$oiii" ]] || die "no result_OIII_*.fit in $nbdir"
+dt=$(( $(stat -c %Y "$ha") - $(stat -c %Y "$oiii") )); dt=${dt#-}
+[[ $dt -le 3600 ]] || echo "  WARNING: $(basename "$ha") and $(basename "$oiii") weren't made in the same run" >&2
+
+# the stars: the broadband stack, else the none stack
+bb=""
+if [[ $no_stars -eq 0 ]]; then
+  if [[ -z "$bb_name" ]]; then
+    for f in broadband none; do
+      compgen -G "$proc/$f/result_[0-9]*s.fit" >/dev/null && { bb_name="$f"; break; }
+    done
+  fi
+  if [[ -n "$bb_name" ]]; then
+    bb="$(newest "$proc/$bb_name"/result_[0-9]*s.fit)"
+    [[ -n "$bb" ]] || die "no result_<seconds>s.fit in $proc/$bb_name"
+  fi
+fi
+
+fits_key() {
+  head -c 28800 "$1" | fold -w 80 | grep -a -m1 "^$2 *=" \
+    | sed -E "s/^[^=]*= *//; s| */.*$||; s/'//g; s/ *$//" || true
+}
+
+# total exposure of the Ha stack, for the output name
+live="$(fits_key "$ha" LIVETIME)"
+if [[ -z "$live" && "$(basename "$ha")" =~ _([0-9]+)s\.fit$ ]]; then live="${BASH_REMATCH[1]}"; fi
+live="$(printf '%.0f' "${live:-0}")"
+
+out="$proc/HOO"
+work="$out/work"
+
+echo "Target:  $target"
+echo "Ha:      $ha"
+echo "OIII:    $oiii"
+if [[ -n "$bb" ]]; then
+  echo "Stars:   $bb (Ha and OIII are aligned to this frame)"
+else
+  echo "Stars:   none; OIII is aligned to Ha"
+fi
+echo "Output:  $out/result_${live}s.fit"
+echo
+
+# ---------------------------------------------------------------- Siril scripts
+
+# Sequence nb_ in the work folder: 1 = reference (broadband green, or Ha), then Ha, OIII
+if [[ -n "$bb" ]]; then i_ha=2; i_oiii=3; else i_ha=1; i_oiii=2; fi
+fname() { printf 'nb_%05d' "$1"; }
+
+split_ssf="$(cat <<EOF
+# Generated by astro-hoo: the broadband stack's green channel is the reference frame
+requires 1.4.0
+setext fit
+set32bits
+cd $work
+load $bb
+split bb_r $(fname 1) bb_b
+EOF
+)"
+
+combine_ssf="$(cat <<EOF
+# Generated by astro-hoo: align Ha and OIII to frame 1, then compose HOO
+requires 1.4.0
+setext fit
+set32bits
+cd $work
+setref nb 1
+register nb -transf=similarity
+load r_$(fname "$i_ha")
+save Ha_aligned
+load r_$(fname "$i_oiii")
+save OIII_aligned
+EOF
+)"
+if [[ $match -eq 1 ]]; then
+  combine_ssf+=$'\n'"# bring OIII to Ha's background and scale, so both survive the same stretch"
+  combine_ssf+=$'\n'"linear_match Ha_aligned 0 0.92"
+  combine_ssf+=$'\n'"save OIII_matched"
+  g=OIII_matched
+else
+  g=OIII_aligned
+fi
+# -nosum: the three channels share one exposure; don't add it up three times
+combine_ssf+=$'\n'"rgbcomp Ha_aligned $g $g -out=hoo -nosum"
+
+if [[ $dry_run -eq 1 ]]; then
+  if [[ -n "$bb" ]]; then echo "--- split.ssf"; echo "$split_ssf"; echo; fi
+  echo "--- combine.ssf"; echo "$combine_ssf"; echo
+  echo "Dry run: nothing written."
+  exit 0
+fi
+
+if [[ -n "${SIRIL_CLI:-}" ]]; then
+  read -r -a siril <<< "$SIRIL_CLI"
+elif command -v siril-cli >/dev/null 2>&1; then
+  siril=(siril-cli)
+elif command -v flatpak >/dev/null 2>&1; then
+  siril=(flatpak run --command=siril-cli org.siril.Siril)
+else
+  die "siril-cli not found (neither on PATH nor as the org.siril.Siril flatpak)."
+fi
+
+rm -rf "$work"
+mkdir -p "$work" "$out/logs"
+
+# run_siril NAME SCRIPT: run a Siril script, logging to HOO/logs/NAME-<time>.log
+run_siril() {
+  local ssf="$out/logs/$1.ssf" log="$out/logs/$1-$(date +%Y%m%d-%H%M%S).log"
+  printf '%s\n' "$2" > "$ssf"
+  echo "Running Siril ($1). Log: $log"
+  if ! "${siril[@]}" -d "$work" -s "$ssf" > "$log" 2>&1; then
+    tail -n 20 "$log" >&2
+    die "Siril failed; see $log"
+  fi
+}
+
+# The stacks are linked in under the sequence's names; Siril reads them through the links.
+ln -s "$ha" "$work/$(fname "$i_ha").fit"
+ln -s "$oiii" "$work/$(fname "$i_oiii").fit"
+if [[ -n "$bb" ]]; then
+  run_siril split "$split_ssf"
+  rm -f "$work/bb_r.fit" "$work/bb_b.fit"
+fi
+[[ -f "$work/$(fname 1).fit" ]] || die "reference frame $(fname 1).fit is missing"
+run_siril combine "$combine_ssf"
+
+for f in hoo Ha_aligned OIII_aligned; do
+  [[ -f "$work/$f.fit" ]] || die "Siril finished but $f.fit is missing; see $out/logs"
+done
+final="$out/result_${live}s.fit"
+rm -f "$out"/result_*.fit
+mv -f "$work/hoo.fit" "$final"
+mv -f "$work/Ha_aligned.fit" "$out/Ha.fit"
+mv -f "$work/OIII_aligned.fit" "$out/OIII.fit"
+[[ $keep -eq 1 ]] || rm -rf "$work"
+
+echo
+echo "HOO:   $final"
+echo "Next:"
+[[ -z "$bb" ]] || echo "  astro-linear $proc/$bb_name     (stars: ${target// /_}_${bb_name}_starmask.fit)"
+echo "  astro-linear $out"
+[[ -z "$bb" ]] || echo "Use the same --crop for both, so the starless HOO and the star mask line up."

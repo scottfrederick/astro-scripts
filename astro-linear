@@ -4,10 +4,23 @@
 #
 #   astro-linear [options] [DIR | STACK.fit]
 #
-# DIR can be the -processed folder astro-preprocess writes (e.g. ~/Astro/M33-processed)
-# or the source target folder (~/Astro/M33, which maps to ~/Astro/M33-processed), and
-# defaults to the current folder. The newest result_*.fit there is used, unless a
-# stack file is given. Then it runs the linear steps:
+# Stacks come from astro-preprocess, one per filter folder (target/filter/session,
+# filter being none, broadband, narrowband or dualband). DIR is the filter folder's
+# -processed folder (~/Astro/IC1805-processed/broadband) or its source folder
+# (~/Astro/IC1805/broadband), and defaults to the current folder. A target or its
+# -processed folder works too when it has only one stack. The newest result_*.fit
+# there is used, unless a stack file is given.
+#
+# Outputs are named <target>_<filter> (IC1805_broadband_*). The folder also sets the
+# color calibration:
+#   none         SPCC with no filter
+#   broadband    SPCC with "Optolong L-Pro"
+#   narrowband   none (SPCC has no narrowband filters)
+#   HOO          none (made by astro-hoo from the dualband folder's Ha and OIII)
+# --filter, --pcc and --no-color override it. The dualband folder's Ha and OIII
+# stacks go through astro-hoo first.
+#
+# Then it runs the linear steps:
 #
 #   1. crop      cut a fixed percentage off the edges (field curvature, stacking edges)
 #   2. bg        remove the gradient (subsky)                    -> <name>_bg.fit
@@ -51,7 +64,8 @@
 #                         but can subtract faint halos; check the preview)
 #       --samples N       background samples per row (default 20)
 #       --sensor NAME     SPCC OSC sensor (default "Sony IMX571")
-#       --filter NAME     SPCC OSC filter (default "Optolong L-Pro"; "none" for no filter)
+#       --filter NAME     SPCC OSC filter (default from the folder, see above: "none"
+#                         or "Optolong L-Pro"); "none" for no filter
 #       --pcc             skip SPCC and use photometric color calibration
 #       --no-color        skip plate solving and color calibration (fields with too
 #                         few stars to solve, e.g. a planet and its moons)
@@ -68,11 +82,13 @@
 #   -h, --help            show this help
 #
 # Examples:
-#   astro-linear ~/Astro/M33-processed
-#   cd ~/Astro/M33 && astro-linear
-#   astro-linear --filter none --rmgreen ~/Astro/M33-processed
-#   astro-linear --from color --pcc ~/Astro/M33-processed
-#   astro-linear -c 0 --no-color --no-starnet --dehalo ~/Astro/Saturn-moons-processed/result_2026-11-09-1.0s_120s.fit
+#   astro-linear ~/Astro/M33-processed/broadband
+#   cd ~/Astro/M33/broadband && astro-linear
+#   astro-linear --filter none --rmgreen ~/Astro/M33-processed/broadband
+#   astro-linear ~/Astro/IC1805-processed/broadband
+#   astro-linear ~/Astro/IC1805-processed/HOO
+#   astro-linear --from color --pcc ~/Astro/M33-processed/broadband
+#   astro-linear -c 0 --no-color --no-starnet --dehalo ~/Astro/Saturn-moons-processed/none/result_2026-11-09-1.0s_120s.fit
 
 set -euo pipefail
 shopt -s nullglob
@@ -82,7 +98,9 @@ degree=1
 rbf=0
 samples=20
 sensor="Sony IMX571"
-filter="Optolong L-Pro"
+filter="none"
+broadband_filter="Optolong L-Pro"   # SPCC filter for the broadband folder
+filter_set=0
 use_pcc=0
 no_color=0
 dehalo=0
@@ -104,7 +122,7 @@ while [[ $# -gt 0 ]]; do
     --rbf)         rbf=1; shift ;;
     --samples)     samples="$2"; shift 2 ;;
     --sensor)      sensor="$2"; shift 2 ;;
-    --filter)      filter="$2"; shift 2 ;;
+    --filter)      filter="$2"; filter_set=1; shift 2 ;;
     --pcc)         use_pcc=1; shift ;;
     --no-color)    no_color=1; shift ;;
     --dehalo)      dehalo=1; shift ;;
@@ -127,15 +145,42 @@ case "$from" in crop|bg|solve|color|stars) ;; *) die "--from must be crop, bg, s
 
 # ---------------------------------------------------------------- locate the stack
 
+filter_names="none broadband narrowband dualband"
+is_filter_dir() { [[ " $filter_names HOO " == *" $1 "* ]]; }
+
 if [[ -d "$input" ]]; then
   dir="$(cd "$input" && pwd)"
-  if [[ "$dir" != *-processed ]]; then
-    src_ok=0; for d in "$dir"/*/; do [[ -d "$d/Light" ]] && { src_ok=1; break; }; done
-    [[ $src_ok -eq 1 ]] || die "$dir isn't a -processed folder or a target folder with session folders"
-    [[ -d "$dir-processed" ]] || die "$dir-processed not found (run astro-preprocess first)"
-    dir="$dir-processed"
+  parent="$(dirname "$dir")"
+  if [[ "$parent" == *-processed ]]; then
+    :   # a filter folder (or HOO) in a -processed folder
+  elif is_filter_dir "$(basename "$dir")"; then
+    # a filter folder's source: ~/Astro/IC1805/broadband -> ~/Astro/IC1805-processed/broadband
+    dir="$parent-processed/$(basename "$dir")"
+    [[ -d "$dir" ]] || die "$dir not found (run astro-preprocess first)"
+  else
+    # a target or its -processed folder: use its stack if it has only one
+    [[ "$dir" == *-processed ]] || dir="$dir-processed"
+    [[ -d "$dir" ]] || die "$dir not found (run astro-preprocess first)"
+    fdirs=(); for d in "$dir"/*/; do compgen -G "${d}result_[0-9]*s.fit" >/dev/null && fdirs+=("${d%/}"); done
+    if [[ ${#fdirs[@]} -eq 1 ]]; then
+      dir="${fdirs[0]}"
+    elif [[ ${#fdirs[@]} -gt 1 ]]; then
+      echo "error: $dir holds one stack per filter folder; run astro-linear on one of them:" >&2
+      for d in "${fdirs[@]}"; do echo "  astro-linear $d" >&2; done
+      exit 1
+    elif compgen -G "$dir/dualband/result_Ha_*.fit" >/dev/null; then
+      die "only Ha and OIII stacks in $dir/dualband; combine them first with: astro-hoo $dir"
+    else
+      die "no stacks in the filter folders of $dir (run astro-preprocess first)"
+    fi
   fi
   stacks=( "$dir"/result_*.fit )
+  # Ha and OIII stacks are combined by astro-hoo, not processed one by one
+  bb_stacks=(); for f in "${stacks[@]}"; do [[ "$(basename "$f")" =~ ^result_(Ha|OIII)_ ]] || bb_stacks+=("$f"); done
+  if [[ ${#stacks[@]} -gt 0 && ${#bb_stacks[@]} -eq 0 ]]; then
+    die "$dir holds Ha and OIII stacks; combine them first with: astro-hoo $(dirname "$dir")"
+  fi
+  stacks=( "${bb_stacks[@]}" )
   [[ ${#stacks[@]} -gt 0 ]] || die "no result_*.fit in $dir (run astro-preprocess first)"
   stack="$(ls -t "${stacks[@]}" | head -n1)"
 else
@@ -145,13 +190,33 @@ else
 fi
 [[ "$dir" != *" "* ]] || die "path contains a space, which Siril scripts can't handle: $dir"
 
-# Output names start with the target: M33-processed -> M33. A per-session stack
-# from astro-preprocess --separate (result_<session>_<seconds>s.fit) adds the session.
-name="$(basename "$dir")"; name="${name%-processed}"; name="${name// /_}"
+# Output names are the target and the filter folder: IC1805-processed/broadband ->
+# IC1805_broadband (a stack file elsewhere is named after its folder). A per-session
+# stack from astro-preprocess --separate (result_<session>_<seconds>s.fit) adds the session.
+filter_dir=""
+if [[ "$(dirname "$dir")" == *-processed ]] && is_filter_dir "$(basename "$dir")"; then
+  filter_dir="$(basename "$dir")"
+  name="$(basename "$(dirname "$dir")")"; name="${name%-processed}_$filter_dir"
+else
+  name="$(basename "$dir")"; name="${name%-processed}"
+fi
+name="${name// /_}"
 if [[ "$(basename "$stack" .fit)" =~ ^result_(.+)_[0-9]+s$ ]]; then name="${name}_${BASH_REMATCH[1]}"; fi
 # Siril reads anything after a dot in a name as a file extension (0.5s -> ".5s"),
 # so the names it loads and saves must not contain dots.
 name="${name//./_}"
+
+# The folder sets the color calibration, unless --filter, --pcc or --no-color says otherwise.
+if [[ $filter_set -eq 0 && $use_pcc -eq 0 && $no_color -eq 0 ]]; then
+  case "$filter_dir" in
+    broadband)  filter="$broadband_filter" ;;
+    narrowband) no_color=1
+                echo "narrowband folder: no plate solving or color calibration (SPCC has no narrowband filters)" ;;
+    HOO)        no_color=1
+                echo "HOO image (astro-hoo): no plate solving or color calibration" ;;
+    *)          filter="none" ;;
+  esac
+fi
 
 fits_key() {
   head -c 28800 "$1" | fold -w 80 | grep -a -m1 "^$2 *=" \

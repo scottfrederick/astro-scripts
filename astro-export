@@ -23,7 +23,7 @@
 #
 # Examples:
 #   astro-export -s 2 ~/Astro/Saturn-processed/2026-11-09/*_finished.fits
-#   astro-export ~/Astro/M33-processed/M33_final.fit
+#   astro-export ~/Astro/M33-processed/broadband/M33_broadband_final.fit
 #   astro-export -s 1.5 -q 90 image_finished.fits
 
 set -euo pipefail
