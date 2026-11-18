@@ -265,7 +265,11 @@ fi
 
 if should_run solve && [[ $no_color -eq 0 ]]; then
   need "${name}_bg"
-  printf 'load %s\nplatesolve\nsave %s\n' "${name}_bg" "${name}_bg" | run_step "solve$sfx" || {
+  # update_key: Siril 1.4.4 carries the WCS forward from the stack but writes
+  # EQUINOX = 9.87654321E+107 (an unset placeholder), and tools then can't
+  # solve any later file. Every later step loads _bg, so fixing it here
+  # covers _linear, _starless and _starmask too.
+  printf 'load %s\nplatesolve\nupdate_key EQUINOX 2000.\nsave %s\n' "${name}_bg" "${name}_bg" | run_step "solve$sfx" || {
     echo "   Check that FOCALLEN in the header is right (952 native, 666 with the reducer)," >&2
     echo "   and that Siril can reach its star catalogs." >&2
     exit 1
@@ -277,6 +281,8 @@ fi
 color_script() { # color_script CALIBRATION_COMMAND
   echo "load ${name}_bg"
   [[ -z "$1" ]] || echo "$1"
+  # repeats the solve step's EQUINOX fix, for --no-color runs that skip that step
+  echo "update_key EQUINOX 2000."
   [[ $rmgreen -eq 0 ]] || echo "rmgreen"
   [[ -z "$denoise" ]] || echo "denoise -mod=$denoise"
   echo "save ${name}_linear"
