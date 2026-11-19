@@ -49,8 +49,10 @@
 # are calibrated without debayering, each frame is split into Ha (red pixels) and OIII
 # (green and blue pixels) with Siril's seqextract_HaOIII, Ha upsampled to full size,
 # and the two are stacked separately -> result_Ha_<seconds>s.fit and
-# result_OIII_<seconds>s.fit. astro-hoo combines them. The other folders, narrowband
-# included, are stacked as ordinary color.
+# result_OIII_<seconds>s.fit. astro-hoo combines them. With --relaxed, each band also
+# gets a full stack from every frame that could be aligned (fullstack_Ha_<seconds>s.fit,
+# fullstack_OIII_<seconds>s.fit), which astro-hoo turns into a full HOO for the
+# starless image. The other folders, narrowband included, are stacked as ordinary color.
 #
 # Short-exposure sets with no calibration frames (e.g. Saturn's moons shot as an
 # Autorun) use --lights-only: sessions need only a Light folder; hot pixels are
@@ -84,8 +86,9 @@
 #                        rotation/scale fit) and write two stacks: result_<s>s.fit
 #                        from the round-star frames only, as usual, and
 #                        fullstack_<s>s.fit from every frame that could be aligned,
-#                        for the starless image (astro-linear uses both); not with
-#                        --planet
+#                        for the starless image (astro-linear uses both); in the
+#                        dualband folder, both for each of Ha and OIII (astro-hoo
+#                        combines them); not with --planet
 #       --seqsubsky      remove a first-degree gradient from each calibrated frame
 #                        before registration (moonlit nights, or a gradient that
 #                        turns with a meridian flip); not with --planet
@@ -101,6 +104,7 @@
 #   astro-preprocess --seqsubsky ~/Astro/M33/none
 #   astro-preprocess --relaxed ~/Astro/M33
 #   astro-preprocess ~/Astro/IC1805/dualband 2026-11-20   (Ha and OIII stacks)
+#   astro-preprocess --relaxed ~/Astro/IC1805/dualband    (plus full Ha and OIII stacks)
 #   astro-preprocess --lights-only --planet ~/Astro/Saturn-moons/none
 #   astro-preprocess -p ~/Astro/M33/none 2026-11-13
 #   astro-preprocess -n ~/Astro/M33
@@ -224,8 +228,8 @@ if [[ -z "$out" ]]; then
   [[ $dry_run -eq 1 ]] || mkdir -p "$(dirname "$out")"
 fi
 if [[ "$(basename "$target")" == dualband ]]; then
-  [[ $lights_only -eq 0 && $separate -eq 0 && $relaxed -eq 0 ]] \
-    || die "the dualband folder is stacked as Ha and OIII, which can't be combined with --lights-only, --separate, --planet or --relaxed"
+  [[ $lights_only -eq 0 && $separate -eq 0 ]] \
+    || die "the dualband folder is stacked as Ha and OIII, which can't be combined with --lights-only, --separate or --planet"
   narrowband=1
 fi
 
@@ -736,7 +740,17 @@ if [[ $separate -eq 1 ]]; then
     finish_stack "$stackdir/result_${s_name[$i]}.fit" "result_${s_name[$i]}_" "${s_exptime[$i]}"
   done
 elif [[ $narrowband -eq 1 ]]; then
-  echo "Frames: $total_lights calibrated, $(stack_count "$stackdir/result_Ha.fit") stacked in Ha, $(stack_count "$stackdir/result_OIII.fit") in OIII"
+  if [[ $relaxed -eq 1 ]]; then
+    for band in Ha OIII; do
+      echo "Frames ($band): $total_lights calibrated, $(stack_count "$stackdir/result_${band}_full.fit") aligned (full stack), $(stack_count "$stackdir/result_$band.fit") with round stars (strict stack)"
+      if [[ "$(stack_count "$stackdir/result_${band}_full.fit")" == "$(stack_count "$stackdir/result_$band.fit")" && $filter -eq 1 ]]; then
+        warn "$band: both stacks contain the same frames: the round-star filter had no effect on the strict stack"
+      fi
+      finish_stack "$stackdir/result_${band}_full.fit" "fullstack_${band}_" "$ref_exptime"
+    done
+  else
+    echo "Frames: $total_lights calibrated, $(stack_count "$stackdir/result_Ha.fit") stacked in Ha, $(stack_count "$stackdir/result_OIII.fit") in OIII"
+  fi
   finish_stack "$stackdir/result_Ha.fit" "result_Ha_" "$ref_exptime"
   finish_stack "$stackdir/result_OIII.fit" "result_OIII_" "$ref_exptime"
   echo "Next: astro-hoo $(dirname "$out" | sed "s|^$HOME|~|")  (combines Ha and OIII, aligned to the broadband stack)"

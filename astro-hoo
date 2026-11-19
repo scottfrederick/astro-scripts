@@ -9,6 +9,8 @@
 # or one of its filter folders, and defaults to the current folder:
 #   ~/Astro/IC1805-processed/dualband/result_Ha_<s>s.fit       Ha and OIII stacks
 #   ~/Astro/IC1805-processed/dualband/result_OIII_<s>s.fit
+#   ~/Astro/IC1805-processed/dualband/fullstack_Ha_<s>s.fit    full stacks, if made with
+#   ~/Astro/IC1805-processed/dualband/fullstack_OIII_<s>s.fit  astro-preprocess --relaxed
 #   ~/Astro/IC1805-processed/broadband/result_<s>s.fit         the stars
 #
 # Ha and OIII are registered onto the star stack's green channel, so the HOO image
@@ -18,9 +20,17 @@
 # fainter signal isn't lost in the stretch, and the channels are composed as
 # R = Ha, G = OIII, B = OIII.
 #
+# When the dualband stack was made with astro-preprocess --relaxed, its full Ha and
+# OIII stacks (every frame that could be aligned, trailed ones included) are aligned
+# to the same frame and composed the same way into a second HOO image,
+# fullstack_<seconds>s.fit. astro-linear then takes the starless image from it (the
+# most nebula signal) and the stars, if it needs any, from result_<seconds>s.fit.
+#
 # Output goes to <target>-processed/HOO:
-#   result_<seconds>s.fit   linear HOO, named after the Ha stack's total exposure
-#   Ha.fit, OIII.fit        the aligned linear channels (OIII before matching)
+#   result_<seconds>s.fit     linear HOO, named after the Ha stack's total exposure
+#   Ha.fit, OIII.fit          the aligned linear channels (OIII before matching)
+#   fullstack_<seconds>s.fit  linear HOO from the full stacks (--relaxed only)
+#   Ha_full.fit, OIII_full.fit  their aligned channels
 # Next:
 #   astro-linear ~/Astro/IC1805-processed/broadband   stars: IC1805_broadband_starmask.fit
 #   astro-linear ~/Astro/IC1805-processed/HOO         IC1805_HOO_starless.fit
@@ -37,6 +47,7 @@
 #                      (default: broadband if it has a stack, else none)
 #       --no-stars     don't use a broadband stack; align OIII to Ha
 #       --no-match     compose OIII as stacked, without matching it to Ha
+#       --no-full      ignore full stacks from astro-preprocess --relaxed
 #       --keep         keep the work folder (HOO/work)
 #   -n, --dry-run      show what would be combined and print the Siril scripts
 #   -h, --help         show this help
@@ -54,6 +65,7 @@ bb_name=""
 no_stars=0
 match=1
 keep=0
+use_full=1
 dry_run=0
 input=""
 
@@ -65,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --stars)       bb_name="$2"; shift 2 ;;
     --no-stars)    no_stars=1; shift ;;
     --no-match)    match=0; shift ;;
+    --no-full)     use_full=0; shift ;;
     --keep)        keep=1; shift ;;
     -n|--dry-run)  dry_run=1; shift ;;
     -h|--help)     usage; exit 0 ;;
@@ -108,6 +121,21 @@ oiii="$(newest "$nbdir"/result_OIII_*.fit)"
 dt=$(( $(stat -c %Y "$ha") - $(stat -c %Y "$oiii") )); dt=${dt#-}
 [[ $dt -le 3600 ]] || echo "  WARNING: $(basename "$ha") and $(basename "$oiii") weren't made in the same run" >&2
 
+# full stacks (astro-preprocess --relaxed), used only if both were made in the Ha stack's run
+same_run() { local d; d=$(( $(stat -c %Y "$1") - $(stat -c %Y "$ha") )); d=${d#-}; [[ $d -le 3600 ]]; }
+ha_full=""; oiii_full=""
+if [[ $use_full -eq 1 ]]; then
+  ha_full="$(newest "$nbdir"/fullstack_Ha_*.fit)"
+  oiii_full="$(newest "$nbdir"/fullstack_OIII_*.fit)"
+  if [[ -n "$ha_full" && -n "$oiii_full" ]] && same_run "$ha_full" && same_run "$oiii_full"; then
+    :
+  else
+    [[ -z "$ha_full$oiii_full" ]] \
+      || echo "  WARNING: ignoring full stacks in $nbdir: not a matching Ha and OIII pair from the same run as $(basename "$ha")" >&2
+    ha_full=""; oiii_full=""
+  fi
+fi
+
 # the stars: the broadband stack, else the none stack
 bb=""
 if [[ $no_stars -eq 0 ]]; then
@@ -131,6 +159,12 @@ fits_key() {
 live="$(fits_key "$ha" LIVETIME)"
 if [[ -z "$live" && "$(basename "$ha")" =~ _([0-9]+)s\.fit$ ]]; then live="${BASH_REMATCH[1]}"; fi
 live="$(printf '%.0f' "${live:-0}")"
+live_full=""
+if [[ -n "$ha_full" ]]; then
+  live_full="$(fits_key "$ha_full" LIVETIME)"
+  if [[ -z "$live_full" && "$(basename "$ha_full")" =~ _([0-9]+)s\.fit$ ]]; then live_full="${BASH_REMATCH[1]}"; fi
+  live_full="$(printf '%.0f' "${live_full:-0}")"
+fi
 
 out="$proc/HOO"
 work="$out/work"
@@ -138,18 +172,25 @@ work="$out/work"
 echo "Target:  $target"
 echo "Ha:      $ha"
 echo "OIII:    $oiii"
+if [[ -n "$ha_full" ]]; then
+  echo "Full:    $ha_full"
+  echo "         $oiii_full (full HOO for the starless image)"
+fi
 if [[ -n "$bb" ]]; then
   echo "Stars:   $bb (Ha and OIII are aligned to this frame)"
 else
   echo "Stars:   none; OIII is aligned to Ha"
 fi
 echo "Output:  $out/result_${live}s.fit"
+[[ -z "$ha_full" ]] || echo "         $out/fullstack_${live_full}s.fit"
 echo
 
 # ---------------------------------------------------------------- Siril scripts
 
 # Sequence nb_ in the work folder: 1 = reference (broadband green, or Ha), then Ha, OIII
+# and, with full stacks, full Ha and full OIII
 if [[ -n "$bb" ]]; then i_ha=2; i_oiii=3; else i_ha=1; i_oiii=2; fi
+i_haf=$((i_oiii + 1)); i_oiiif=$((i_oiii + 2))
 fname() { printf 'nb_%05d' "$1"; }
 
 split_ssf="$(cat <<EOF
@@ -170,7 +211,14 @@ setext fit
 set32bits
 cd $work
 setref nb 1
-register nb -transf=similarity
+EOF
+)"
+# a full stack's stars are smeared by its trailed frames; detect them anyway, then restore
+# Siril's defaults (it remembers star detection settings between runs)
+[[ -z "$ha_full" ]] || combine_ssf+=$'\n'"setfindstar -relax=on -roundness=0.3"
+combine_ssf+=$'\n'"register nb -transf=similarity"
+[[ -z "$ha_full" ]] || combine_ssf+=$'\n'"setfindstar reset"
+combine_ssf+=$'\n'"$(cat <<EOF
 load r_$(fname "$i_ha")
 save Ha_aligned
 load r_$(fname "$i_oiii")
@@ -187,6 +235,21 @@ else
 fi
 # -nosum: the three channels share one exposure; don't add it up three times
 combine_ssf+=$'\n'"rgbcomp Ha_aligned $g $g -out=hoo -nosum"
+if [[ -n "$ha_full" ]]; then
+  combine_ssf+=$'\n'"# the same for the full stacks"
+  combine_ssf+=$'\n'"load r_$(fname "$i_haf")"
+  combine_ssf+=$'\n'"save Ha_full_aligned"
+  combine_ssf+=$'\n'"load r_$(fname "$i_oiiif")"
+  combine_ssf+=$'\n'"save OIII_full_aligned"
+  if [[ $match -eq 1 ]]; then
+    combine_ssf+=$'\n'"linear_match Ha_full_aligned 0 0.92"
+    combine_ssf+=$'\n'"save OIII_full_matched"
+    gf=OIII_full_matched
+  else
+    gf=OIII_full_aligned
+  fi
+  combine_ssf+=$'\n'"rgbcomp Ha_full_aligned $gf $gf -out=hoo_full -nosum"
+fi
 
 if [[ $dry_run -eq 1 ]]; then
   if [[ -n "$bb" ]]; then echo "--- split.ssf"; echo "$split_ssf"; echo; fi
@@ -222,6 +285,10 @@ run_siril() {
 # The stacks are linked in under the sequence's names; Siril reads them through the links.
 ln -s "$ha" "$work/$(fname "$i_ha").fit"
 ln -s "$oiii" "$work/$(fname "$i_oiii").fit"
+if [[ -n "$ha_full" ]]; then
+  ln -s "$ha_full" "$work/$(fname "$i_haf").fit"
+  ln -s "$oiii_full" "$work/$(fname "$i_oiiif").fit"
+fi
 if [[ -n "$bb" ]]; then
   run_siril split "$split_ssf"
   rm -f "$work/bb_r.fit" "$work/bb_b.fit"
@@ -229,18 +296,29 @@ fi
 [[ -f "$work/$(fname 1).fit" ]] || die "reference frame $(fname 1).fit is missing"
 run_siril combine "$combine_ssf"
 
-for f in hoo Ha_aligned OIII_aligned; do
+expect=(hoo Ha_aligned OIII_aligned)
+[[ -z "$ha_full" ]] || expect+=(hoo_full Ha_full_aligned OIII_full_aligned)
+for f in "${expect[@]}"; do
   [[ -f "$work/$f.fit" ]] || die "Siril finished but $f.fit is missing; see $out/logs"
 done
 final="$out/result_${live}s.fit"
-rm -f "$out"/result_*.fit
+# old outputs go, so astro-linear can't pair a new result_ with an old fullstack_
+rm -f "$out"/result_*.fit "$out"/fullstack_*.fit "$out/Ha_full.fit" "$out/OIII_full.fit"
 mv -f "$work/hoo.fit" "$final"
 mv -f "$work/Ha_aligned.fit" "$out/Ha.fit"
 mv -f "$work/OIII_aligned.fit" "$out/OIII.fit"
+final_full=""
+if [[ -n "$ha_full" ]]; then
+  final_full="$out/fullstack_${live_full}s.fit"
+  mv -f "$work/hoo_full.fit" "$final_full"
+  mv -f "$work/Ha_full_aligned.fit" "$out/Ha_full.fit"
+  mv -f "$work/OIII_full_aligned.fit" "$out/OIII_full.fit"
+fi
 [[ $keep -eq 1 ]] || rm -rf "$work"
 
 echo
 echo "HOO:   $final"
+[[ -z "$final_full" ]] || echo "Full:  $final_full (astro-linear takes the starless image from it)"
 echo "Next:"
 [[ -z "$bb" ]] || echo "  astro-linear $proc/$bb_name     (stars: ${target// /_}_${bb_name}_starmask.fit)"
 echo "  astro-linear $out"
